@@ -16,6 +16,10 @@ class Question:
     help_text: str = ""
     options: tuple[str, ...] = ()
     allow_custom: bool = True
+    # show_if: sequence of (answer_key, accepted_value) pairs.
+    # If non-empty the question is shown only when at least one pair matches
+    # the current answers (OR logic).  Empty = always shown.
+    show_if: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -75,6 +79,52 @@ COMMON_QUESTIONS: tuple[Question, ...] = (
         options=("On-premises", "Cloud", "Hybrid"),
     ),
     Question(
+        "site_topology",
+        "What is the site topology for this deployment?",
+        help_text="Single site is most common. Multi-site introduces DR and replication considerations.",
+        options=("Single site", "Multi-site"),
+    ),
+    Question(
+        "access_type",
+        "Who needs access to the environment?",
+        help_text="This drives whether UAG, load balancers, and FQDN strategy are required.",
+        options=("Internal users only", "External users only", "Both internal and external"),
+    ),
+    Question(
+        "load_balancer",
+        "Do you have a load balancer available for this deployment?",
+        help_text="Customer-provided. Required for UAG HA and Connection Server redundancy. "
+                  "Without one, high-availability options are limited and custom config is needed.",
+        options=("Yes — F5 / NetScaler / NSX ALB", "Yes — other (specify)", "No load balancer"),
+        allow_custom=True,
+        show_if=(
+            ("access_type", "External users only"),
+            ("access_type", "Both internal and external"),
+        ),
+    ),
+    Question(
+        "fqdn_strategy",
+        "Will you use a single FQDN for both internal and external users?",
+        help_text="Single FQDN requires Split DNS: private DNS resolves to the internal LB IP, "
+                  "public DNS resolves to the UAG / public LB IP.",
+        options=("Yes — single FQDN with Split DNS", "No — separate internal and external URLs"),
+        show_if=(
+            ("access_type", "Both internal and external"),
+        ),
+    ),
+    Question(
+        "cert_type",
+        "What type of SSL certificate will be used?",
+        help_text="UAG acts as a reverse proxy and must terminate TLS — it needs the private key. "
+                  "Format: PFX with private key, or PEM. "
+                  "Wildcard certs need no further URL planning; SAN certs must list UAG, CS, and AppVol URLs.",
+        options=("Wildcard certificate (*.domain.com)", "SAN / multi-domain certificate", "No certificate yet — need to procure"),
+        show_if=(
+            ("access_type", "External users only"),
+            ("access_type", "Both internal and external"),
+        ),
+    ),
+    Question(
         "identity_source",
         "What is the identity source for authentication and access?",
         help_text="Pick the user directory / identity provider used by the customer.",
@@ -91,6 +141,31 @@ COMMON_QUESTIONS: tuple[Question, ...] = (
         "Which security baseline is required?",
         help_text="Select the control profile that best fits compliance and risk expectations.",
         options=("MFA + conditional access", "Compliance-first (audit heavy)", "Data loss prevention focus", "High security segmentation"),
+    ),
+    Question(
+        "mfa_required",
+        "Is multi-factor authentication (MFA) required?",
+        help_text="MFA placement is determined by your access type: "
+                  "internal-only → configured on Connection Server; "
+                  "external-only → configured on UAG; "
+                  "both → UAG handles external, CS handles internal. "
+                  "If your provider is not natively supported, Workspace ONE Access can be added.",
+        options=("Yes", "No"),
+    ),
+    Question(
+        "mfa_provider",
+        "Which MFA provider is in use?",
+        help_text="SAML-based: Entra ID, Okta, Ping ID (configurable on UAG and CS). "
+                  "RADIUS-based: RSA token / Radius (different protocol — check supported config points).",
+        options=(
+            "Entra ID / Azure AD (SAML)  ~65%",
+            "Okta (SAML)  ~25%",
+            "Radius / RSA token  ~10%",
+            "Ping ID (SAML)  ~5%",
+        ),
+        show_if=(
+            ("mfa_required", "Yes"),
+        ),
     ),
     Question(
         "availability_requirements",
@@ -545,6 +620,18 @@ UAG = Product(
     ),
     follow_up_questions=(
         Question(
+            "uag_nic_config",
+            "How many NICs should the UAG be deployed with?",
+            help_text="1 NIC: port 9443 (admin console) is exposed in the DMZ — brute-force risk, NOT recommended for production. "
+                      "2 NIC (recommended): DMZ NIC handles 443/8443 user traffic; Internal NIC connects to CS and VDI. "
+                      "3 NIC (most secure): DMZ NIC + Internal NIC + dedicated Management NIC on an internal-only network.",
+            options=(
+                "2 NIC — Recommended (DMZ NIC + Internal NIC)",
+                "3 NIC — Most secure (DMZ + Internal + Management NICs)",
+                "1 NIC — Not recommended for production",
+            ),
+        ),
+        Question(
             "uag_services",
             "Which services should Unified Access Gateway publish?",
             help_text="Choose the edge service mix required for this customer.",
@@ -601,12 +688,32 @@ FAMILY_CHOICES: dict[str, tuple[str, ...]] = {
 
 
 def required_questions(selected_product_keys: list[str]) -> list[Question]:
+    """Return the full ordered question list (including conditionally hidden ones)."""
     questions: list[Question] = list(COMMON_QUESTIONS)
     for key in selected_product_keys:
         product = PRODUCTS.get(key)
         if product:
             questions.extend(product.follow_up_questions)
     return questions
+
+
+def visible_questions(selected_product_keys: list[str], answers: dict) -> list[Question]:
+    """Return only questions that should be shown given the current answers.
+
+    A question with a non-empty ``show_if`` is included only when at least one
+    ``(answer_key, accepted_value)`` pair matches the current answers (OR logic).
+    """
+    result: list[Question] = []
+    for question in required_questions(selected_product_keys):
+        if question.show_if:
+            should_show = any(
+                normalize_answer(answers.get(k)) == v
+                for k, v in question.show_if
+            )
+            if not should_show:
+                continue
+        result.append(question)
+    return result
 
 
 def compile_reference_resources(selected_product_keys: list[str]) -> list[Resource]:

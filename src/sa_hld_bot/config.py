@@ -21,6 +21,7 @@ class Settings:
     images_dir: Path
     image_captions_file: Path
     collection_name: str
+    image_collection_name: str
     max_images_per_page: int
     sitemap_resource_only: bool
 
@@ -60,6 +61,7 @@ def load_settings(root_dir: Path) -> Settings:
         images_dir=images_dir,
         image_captions_file=data_dir / "image_captions.jsonl",
         collection_name=os.getenv("CHROMA_COLLECTION_NAME", "omnissa_techzone"),
+        image_collection_name=os.getenv("CHROMA_IMAGE_COLLECTION_NAME", "omnissa_techzone_images"),
         max_images_per_page=max(0, int(os.getenv("MAX_IMAGES_PER_PAGE", "6"))),
         sitemap_resource_only=os.getenv("SITEMAP_RESOURCE_ONLY", "1").strip() != "0",
     )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 import time
 import hashlib
@@ -363,8 +364,52 @@ class TechZoneRagStore:
         self.foundry = foundry
         self.logger = get_logger("sa_hld_bot.rag.store", settings.logs_dir)
         self._embedding_service: HuggingFaceEmbeddingService | None = None
-        self.client = chromadb.PersistentClient(path=str(settings.chroma_dir))
+        self.client = self._open_persistent_client()
         self.collection = self.client.get_or_create_collection(settings.collection_name)
+        self.image_collection = self.client.get_or_create_collection(settings.image_collection_name)
+
+    def _open_persistent_client(self):
+        self.settings.chroma_dir.mkdir(parents=True, exist_ok=True)
+        chroma_path = str(self.settings.chroma_dir)
+        last_exc: Exception | None = None
+
+        for attempt in range(2):
+            try:
+                return chromadb.PersistentClient(path=chroma_path)
+            except Exception as exc:
+                last_exc = exc
+                self.logger.warning(
+                    "Chroma open failed attempt=%s path=%s error=%s",
+                    attempt + 1,
+                    chroma_path,
+                    exc,
+                )
+                time.sleep(1.0)
+
+        recovery_dir = self.settings.data_dir / f"chroma_recovery_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+        try:
+            if self.settings.chroma_dir.exists():
+                shutil.move(str(self.settings.chroma_dir), str(recovery_dir))
+                self.logger.error(
+                    "Chroma store moved to recovery location after repeated startup failure. original=%s recovery=%s",
+                    self.settings.chroma_dir,
+                    recovery_dir,
+                )
+            self.settings.chroma_dir.mkdir(parents=True, exist_ok=True)
+            return chromadb.PersistentClient(path=chroma_path)
+        except Exception as recovery_exc:
+            self.logger.error(
+                "Chroma recovery failed path=%s recovery=%s error=%s",
+                self.settings.chroma_dir,
+                recovery_dir,
+                recovery_exc,
+            )
+            if last_exc is not None:
+                raise RuntimeError(
+                    "Chroma database could not be opened and automatic recovery failed. "
+                    f"Original error: {last_exc}. Recovery error: {recovery_exc}"
+                ) from recovery_exc
+            raise
 
     @property
     def embedding_service(self) -> HuggingFaceEmbeddingService:
@@ -713,6 +758,13 @@ class TechZoneRagStore:
 
         self._save_caption_rows(caption_rows)
 
+        # Sync the semantic image-caption vector collection from the finalized rows so the HLD
+        # image selector can retrieve answer-relevant diagrams by similarity.
+        try:
+            self._index_image_rows(caption_rows, reconcile=True)
+        except Exception as exc:
+            self.logger.warning("Image-caption collection sync failed run_id=%s error=%s", run_id, exc)
+
         stats = {
             "pages_scanned": len(urls),
             "pages_upserted": upserted_pages,
@@ -835,6 +887,187 @@ class TechZoneRagStore:
         matches.reverse()
         return matches
 
+    # Section taxonomy used to spread selected images across distinct slide topics.
+    # Each entry is (slide_title, semantic_intent) — the intent is appended to the
+    # answer-derived base query to bias retrieval toward that slide's subject.
+    _HORIZON_8_SECTIONS: tuple[tuple[str, str], ...] = (
+        ("Core Components - Logical View", "logical architecture overview connection server core components"),
+        ("Core Components - Block Design", "pod block design management and user resource pools"),
+        ("Sizing Best Practices - Configurations", "sizing configuration vm specifications capacity resource pool"),
+        ("Access Architecture", "external access unified access gateway UAG edge remote access"),
+        ("Networking - Network Flows and Ports", "network ports flows traffic ports diagram"),
+        ("Networking - Internal Connections", "internal connection blast pcoip rdp protocol"),
+        ("Networking - External Connections", "external gateway connection blast pcoip rdp protocol"),
+        ("Overall Design", "reference architecture overall deployment environment infrastructure dmz"),
+    )
+    _GENERIC_SECTIONS: tuple[tuple[str, str], ...] = (
+        ("Logical Architecture", "logical architecture overview components"),
+        ("Access / Edge", "access edge gateway external remote connectivity"),
+        ("Networking & Ports", "network ports flows traffic protocol"),
+        ("Overall Design", "reference architecture overall deployment design"),
+    )
+
+    @staticmethod
+    def _image_row_id(row: dict[str, str]) -> str:
+        basis = str(row.get("local_path", "")).strip() or str(row.get("image_url", "")).strip()
+        return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:24]
+
+    @staticmethod
+    def _image_embed_text(row: dict[str, str]) -> str:
+        title = str(row.get("title", "")).strip()
+        caption = str(row.get("caption", "")).strip()
+        combined = f"{title}. {caption}".strip()
+        return combined.strip(". ").strip() or title or caption
+
+    def _index_image_rows(self, rows: list[dict[str, str]], reconcile: bool = False) -> int:
+        """Embed architecture-diagram captions and upsert them into the image collection."""
+        arch_rows = [
+            row
+            for row in rows
+            if row.get("image_type") == "architecture_diagram"
+            and str(row.get("local_path", "")).strip()
+            and Path(str(row.get("local_path", ""))).exists()
+        ]
+        ids: list[str] = []
+        docs: list[str] = []
+        metadatas: list[dict[str, object]] = []
+        valid_ids: set[str] = set()
+        for row in arch_rows:
+            text = self._image_embed_text(row)
+            if not text:
+                continue
+            rid = self._image_row_id(row)
+            if rid in valid_ids:
+                # Same local image referenced from multiple pages — embed once.
+                continue
+            valid_ids.add(rid)
+            ids.append(rid)
+            docs.append(text)
+            metadatas.append(
+                {
+                    "page_url": str(row.get("page_url", "")),
+                    "image_url": str(row.get("image_url", "")),
+                    "local_path": str(row.get("local_path", "")),
+                    "title": str(row.get("title", "")),
+                    "caption": str(row.get("caption", "")),
+                    "image_type": "architecture_diagram",
+                    "caption_version": int(row.get("caption_version", 0) or 0),
+                }
+            )
+        if ids:
+            embeddings = self.embedding_service.embed_texts(docs)
+            self.image_collection.upsert(ids=ids, embeddings=embeddings, documents=docs, metadatas=metadatas)
+        if reconcile:
+            try:
+                existing = self.image_collection.get()
+                existing_ids = existing.get("ids", []) or []
+                stale = [eid for eid in existing_ids if eid not in valid_ids]
+                if stale:
+                    self.image_collection.delete(ids=stale)
+            except Exception as exc:
+                self.logger.debug("Image collection reconcile skipped: %s", exc)
+        return len(ids)
+
+    def _ensure_image_collection_populated(self, rows: list[dict[str, str]]) -> None:
+        """Lazily backfill the image vector collection from existing caption rows."""
+        try:
+            count = self.image_collection.count()
+        except Exception:
+            count = 0
+        if count > 0:
+            return
+        if rows:
+            self._index_image_rows(rows, reconcile=False)
+
+    def _build_image_query(self, selected_products: list[str], answers: dict[str, str]) -> str:
+        """Compose a natural-language query from selected products + salient answers."""
+        from .catalog import PRODUCTS
+
+        parts: list[str] = []
+        for key in selected_products:
+            product = PRODUCTS.get(key)
+            if product:
+                parts.append(product.title)
+        answer_keys = (
+            "hosting_strategy",
+            "site_topology",
+            "access_type",
+            "mfa_required",
+            "mfa_provider",
+            "uag_nic_config",
+            "horizon_8_arch_track",
+            "horizon_access_topology",
+            "horizon_dmz_design",
+            "horizon_protocol_scope",
+        )
+        for key in answer_keys:
+            value = str(answers.get(key, "")).strip()
+            if value:
+                parts.append(value)
+        return " ".join(parts).strip()
+
+    def _semantic_select_images(
+        self,
+        rows: list[dict[str, str]],
+        selected_products: list[str],
+        answers: dict[str, str],
+        reference_urls: list[str],
+        limit: int,
+    ) -> list[dict[str, str]]:
+        self._ensure_image_collection_populated(rows)
+        try:
+            if self.image_collection.count() == 0:
+                return []
+        except Exception:
+            return []
+
+        base_query = self._build_image_query(selected_products, answers)
+        preferred = self._canonical_url_set(reference_urls)
+        sections = self._HORIZON_8_SECTIONS if "horizon_8" in selected_products else self._GENERIC_SECTIONS
+        valid_paths = {str(row.get("local_path", "")) for row in rows}
+
+        selected: list[dict[str, str]] = []
+        used_paths: set[str] = set()
+        n_results = min(15, max(4, limit * 2))
+        for slide_title, intent in sections:
+            if len(selected) >= limit:
+                break
+            query = f"{base_query} {intent}".strip()
+            try:
+                vector = self.embedding_service.embed_text(query)
+                result = self.image_collection.query(
+                    query_embeddings=[vector],
+                    n_results=n_results,
+                    include=["metadatas", "distances"],
+                )
+            except Exception as exc:
+                self.logger.debug("Image query failed for section %s: %s", slide_title, exc)
+                continue
+            metas = result.get("metadatas", [[]])[0]
+            distances = result.get("distances", [[]])[0]
+            best: dict[str, object] | None = None
+            best_distance: float | None = None
+            for meta, distance in zip(metas, distances):
+                local_path = str(meta.get("local_path", ""))
+                if not local_path or local_path in used_paths:
+                    continue
+                if local_path not in valid_paths or not Path(local_path).exists():
+                    continue
+                # Lower distance = more similar. Apply a small soft boost (distance reduction)
+                # when the image's source page is one of the product's reference URLs.
+                effective = float(distance)
+                if self._canonical_url(str(meta.get("page_url", ""))) in preferred:
+                    effective -= 0.15
+                if best_distance is None or effective < best_distance:
+                    best_distance = effective
+                    best = meta
+            if best is not None:
+                chosen = dict(best)
+                chosen["slide_title"] = slide_title
+                used_paths.add(str(best.get("local_path", "")))
+                selected.append(chosen)
+        return selected[:limit]
+
     def select_hld_images(
         self,
         selected_products: list[str],
@@ -858,6 +1091,16 @@ class TechZoneRagStore:
         if not rows:
             return []
 
+        # Primary: semantic, answer-aware selection across ALL products.
+        try:
+            semantic = self._semantic_select_images(rows, selected_products, answers, reference_urls, limit=limit)
+        except Exception as exc:
+            self.logger.warning("Semantic image selection failed: %s", exc)
+            semantic = []
+        if semantic:
+            return semantic
+
+        # Fallbacks: keyword-scored horizon path, then deterministic URL match.
         if "horizon_8" in selected_products:
             return self._select_horizon_8_hld_images(rows, answers, reference_urls, limit=limit)
         return self.best_images_for_urls(reference_urls, limit=limit)

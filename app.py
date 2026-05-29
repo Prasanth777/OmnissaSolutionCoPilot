@@ -19,7 +19,7 @@ if str(SRC) not in sys.path:
 
 from sa_hld_bot.agents import AgenticRagOrchestrator, GuardrailAgent, RetrievalAgent, SolutionAgent
 from sa_hld_bot.azure_foundry import AzureFoundryClient
-from sa_hld_bot.catalog import FAMILY_CHOICES, PRODUCTS, compile_reference_resources, normalize_answer, required_questions
+from sa_hld_bot.catalog import FAMILY_CHOICES, PRODUCTS, compile_reference_resources, normalize_answer, required_questions, visible_questions
 from sa_hld_bot.config import load_settings
 from sa_hld_bot.docx_builder import HldDocxBuilder
 from sa_hld_bot.ppt_builder import HldPptBuilder
@@ -66,7 +66,7 @@ def first_question():
 
 def pending_questions():
     missing = []
-    for question in required_questions(st.session_state.selected_products):
+    for question in visible_questions(st.session_state.selected_products, st.session_state.answers):
         if not normalize_answer(st.session_state.answers.get(question.key)):
             missing.append(question)
     return missing
@@ -78,14 +78,14 @@ def ask_next_question_if_needed() -> None:
         return
     if st.session_state.active_question_key == next_q.key:
         return
-    all_questions = required_questions(st.session_state.selected_products)
+    all_visible = visible_questions(st.session_state.selected_products, st.session_state.answers)
     q_index = 1
-    for idx, question in enumerate(all_questions, start=1):
+    for idx, question in enumerate(all_visible, start=1):
         if question.key == next_q.key:
             q_index = idx
             break
     hint = f"\n\nHint: {next_q.help_text}" if next_q.help_text else ""
-    chat_add("assistant", f"Question {q_index} of {len(all_questions)}: {next_q.prompt}{hint}")
+    chat_add("assistant", f"Question {q_index} of {len(all_visible)}: {next_q.prompt}{hint}")
     st.session_state.active_question_key = next_q.key
 
 
@@ -125,6 +125,7 @@ def initialize_agents():
         str(settings.images_dir),
         str(settings.image_captions_file),
         settings.collection_name,
+        settings.image_collection_name,
         settings.max_images_per_page,
         settings.sitemap_resource_only,
     )
@@ -146,6 +147,7 @@ def _initialize_agents_cached(
     images_dir: str,
     image_captions_file: str,
     collection_name: str,
+    image_collection_name: str,
     max_images_per_page: int,
     sitemap_resource_only: bool,
 ):
@@ -164,6 +166,7 @@ def _initialize_agents_cached(
         images_dir=Path(images_dir),
         image_captions_file=Path(image_captions_file),
         collection_name=collection_name,
+        image_collection_name=image_collection_name,
         max_images_per_page=max_images_per_page,
         sitemap_resource_only=sitemap_resource_only,
     )
@@ -551,7 +554,7 @@ with st.sidebar:
     st.session_state.use_sample_template = bool(use_template)
     st.session_state.sample_template_path = sample_template_path.strip()
 
-total_questions = len(required_questions(st.session_state.selected_products))
+total_questions = len(visible_questions(st.session_state.selected_products, st.session_state.answers))
 complete = total_questions - len(pending_questions())
 
 with st.container(border=True):

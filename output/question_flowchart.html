@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SA HLD Bot – Customer Requirements Question Flow</title>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f0f4f8;
+      padding: 24px;
+    }
+    h1 {
+      text-align: center;
+      color: #1a202c;
+      font-size: 1.5rem;
+      margin-bottom: 6px;
+    }
+    .subtitle {
+      text-align: center;
+      color: #718096;
+      font-size: 0.875rem;
+      margin-bottom: 24px;
+    }
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      justify-content: center;
+      margin-bottom: 24px;
+    }
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.8rem;
+      color: #4a5568;
+    }
+    .legend-box {
+      width: 18px; height: 18px;
+      border-radius: 3px;
+    }
+    .legend-box-warn {
+      width: 18px; height: 18px;
+      border-radius: 3px;
+      border: 2px solid #e53e3e;
+      background: #fff5f5;
+    }
+    .legend-box-info {
+      width: 18px; height: 18px;
+      border-radius: 3px;
+      border: 2px dashed #718096;
+      background: #e2e8f0;
+    }
+    .card {
+      background: white;
+      border-radius: 12px;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+      padding: 24px;
+      overflow-x: auto;
+    }
+    .mermaid {
+      display: flex;
+      justify-content: center;
+    }
+  </style>
+</head>
+<body>
+  <h1>SA HLD Bot — Customer Requirements Question Flow</h1>
+  <p class="subtitle">Common questions → Topology &amp; Access → MFA → Product-specific follow-ups → Generate HLD</p>
+
+  <div class="legend">
+    <div class="legend-item"><div class="legend-box" style="background:#4299e1;"></div> Common (always asked)</div>
+    <div class="legend-item"><div class="legend-box" style="background:#48bb78;"></div> Selection step</div>
+    <div class="legend-item"><div class="legend-box" style="background:#f6e05e; border:1px solid #d69e2e;"></div> MFA decision</div>
+    <div class="legend-item"><div class="legend-box-info"></div> Informational / derived</div>
+    <div class="legend-item"><div class="legend-box-warn"></div> Warning</div>
+    <div class="legend-item"><div class="legend-box" style="background:#ed8936;"></div> Horizon 8</div>
+    <div class="legend-item"><div class="legend-box" style="background:#9f7aea;"></div> Horizon Cloud</div>
+    <div class="legend-item"><div class="legend-box" style="background:#f6ad55;"></div> App Volumes</div>
+    <div class="legend-item"><div class="legend-box" style="background:#fc8181;"></div> DEM</div>
+    <div class="legend-item"><div class="legend-box" style="background:#63b3ed;"></div> WS1 UEM</div>
+    <div class="legend-item"><div class="legend-box" style="background:#68d391;"></div> Omnissa Access</div>
+    <div class="legend-item"><div class="legend-box" style="background:#b794f4;"></div> UAG</div>
+  </div>
+
+  <div class="card">
+    <div class="mermaid">
+flowchart TD
+    START([🚀 Start]) --> FAM
+
+    %% ── Product selection ──────────────────────────────────────────
+    FAM["📦 Select Product Family\n(Omnissa / Broadcom / etc.)"]:::sel
+    FAM --> PROD["🛒 Select Products\nwithin the family"]:::sel
+    PROD --> Q1
+
+    %% ── Common Questions 1-4 ────────────────────────────────────────
+    Q1["Q1 · Customer Name\nFree text"]:::common
+    Q1 --> Q2["Q2 · Industry\n6 options"]:::common
+    Q2 --> Q3["Q3 · Project Scope / Business Objective\n5 options"]:::common
+    Q3 --> Q4["Q4 · User Personas\n6 options"]:::common
+    Q4 --> Q5["Q5 · Hosting Strategy\nOn-prem / Cloud / Hybrid"]:::common
+
+    %% ── Topology sub-branch ─────────────────────────────────────────
+    Q5 --> Q5A["Q5a · Site Topology\nSingle site / Multi-site"]:::common
+    Q5A --> Q5B{{"Q5b · Access Type?"}}
+
+    Q5B -- "Internal only" --> Q6
+    Q5B -- "External or Both" --> LB_Q
+
+    LB_Q["LB · Load Balancer available?\nYes → specify type\nNo → ⚠️ HA for Connection Server is limited\n(custom config required)"]:::common
+    LB_Q --> FQDN_CHK{{"Both internal\n+ external users?"}}
+    FQDN_CHK -- "Yes" --> FQDN_Q
+    FQDN_CHK -- "No\n(external only)" --> CERT_Q
+
+    FQDN_Q["FQDN · Single URL for all users?\nYes → Split DNS required\n(private DNS → internal LB IP\npublic DNS → UAG / public LB IP)\nNo → separate internal + external URLs"]:::common
+    FQDN_Q --> CERT_Q
+
+    CERT_Q["CERT · SSL Certificate type?\nWildcard → no further cert questions\nSAN → list UAG / CS / AppVol URLs\nNone → procure required\nFormat: PFX with private key or PEM"]:::common
+    CERT_Q --> Q6
+
+    %% ── Common Questions 6-8 ────────────────────────────────────────
+    Q6["Q6 · Identity Source\n(AD / Entra ID / Hybrid AD+Entra / LDAP)"]:::common
+    Q6 --> Q7["Q7 · Network Constraints\n4 options"]:::common
+    Q7 --> Q8["Q8 · Security Requirements\n4 options"]:::common
+
+    %% ── MFA Decision Branch ─────────────────────────────────────────
+    Q8 --> MFA_DEC{{"MFA Required?"}}
+    MFA_DEC -- "No" --> Q9
+    MFA_DEC -- "Yes" --> MFA_PROV
+
+    MFA_PROV["MFA · Provider?\nEntra ID / On-prem  ≈65%  SAML\nOkta                ≈25%  SAML\nRadius / RSA token  ≈10%  RADIUS\nPing ID              ≈5%  SAML"]:::mfa
+
+    MFA_PROV --> MFA_NOTE["ℹ️ MFA placement is auto-derived from Q5b\nInternal only  → configure on Connection Server\nExternal only  → configure on UAG\nBoth           → UAG external + CS internal\nUnsupported provider → add Workspace ONE Access"]:::info
+    MFA_NOTE --> Q9
+
+    %% ── Common Questions 9-11 ───────────────────────────────────────
+    Q9["Q9 · Availability Requirements\n4 options"]:::common
+    Q9 --> Q10["Q10 · Implementation Timeline\n4 options"]:::common
+    Q10 --> Q11["Q11 · Assumptions & Constraints\nFree text"]:::common
+
+    Q11 --> BRANCH{{"Any product-specific\nfollow-ups?"}}
+
+    %% ── Branching ───────────────────────────────────────────────────
+    BRANCH -- "Horizon 8 selected" --> H8
+    BRANCH -- "Horizon Cloud selected" --> HC
+    BRANCH -- "App Volumes selected" --> AV
+    BRANCH -- "DEM selected" --> DEM
+    BRANCH -- "WS1 UEM selected" --> UEM
+    BRANCH -- "Omnissa Access selected" --> ACC
+    BRANCH -- "UAG selected" --> UAG
+    BRANCH -- "None / complete" --> GEN
+
+    %% ── Horizon 8 ───────────────────────────────────────────────────
+    H8["Q12 · Architecture Path\n(Core / VMC-AWS / AVS / GCVE / OCI / Alibaba)"]:::h8
+    H8 --> H8b["Q13 · Horizon 8 Workloads\n(Pooled VDI / Persistent VDI / Apps / Mixed)"]:::h8
+    H8b --> H8c["Q14 · Peak Concurrent Users\n(≤500 / 500-2k / 2k-10k / 10k+)"]:::h8
+    H8c --> H8d["Q15 · Image Delivery Strategy\n(Instant Clone / Persistent / App Layering)"]:::h8
+    H8d --> H8e["Q16 · External Access Model\n(None / UAG in DMZ / UAG+LB / Zero Trust)"]:::h8
+
+    H8e --> TOPO["🌐 Traffic flow (informational)\nUser → Internet → Firewall → Load Balancer\n→ UAG reverse proxy  443 / 8443 inbound\n→ re-establishes session to Connection Server\n  443 / 32111 / 22443 outbound\n→ CS authenticates → VDI pool + AD"]:::info
+
+    TOPO --> H8f["Q17 · Remote Access Topology\n(w/o LB / with LB / Global LB)"]:::h8
+    H8f --> H8g["Q18 · DMZ Design\n(Single DMZ  ← most common\nDouble DMZ  ← rare, <1% of deployments\nPer-site DMZ pair / No DMZ)"]:::h8
+    H8g --> H8h["Q19 · Display Protocols\n(Blast Extreme / Blast+PCoIP / Blast+PCoIP+RDP)"]:::h8
+    H8h --> H8i["Q20 · Design Focus Area\n(Mgmt plane / Workloads / Network+UAG / HA+DR)"]:::h8
+    H8i --> GEN
+
+    %% ── Horizon Cloud ───────────────────────────────────────────────
+    HC["Q21 · Cloud Provider\n(Azure / AWS / GCP)"]:::hc
+    HC --> HCb["Q22 · Adoption Scenario\n(DaaS migration / Burst / New / Hybrid CP)"]:::hc
+    HCb --> HCc["Q23 · Connectivity Architecture\n(Private / Internet+UAG / Hub-spoke)"]:::hc
+    HCc --> HCd["Q24 · Architecture Track\n(Next-gen / Security focus / Connectivity-first)"]:::hc
+    HCd --> HCe["Q25 · Design Section Focus\n(Pod / Workloads / Identity / Operations)"]:::hc
+    HCe --> GEN
+
+    %% ── App Volumes ─────────────────────────────────────────────────
+    AV["Q26 · App Volumes Scope\n(App attach / Dynamic entitlements / Lifecycle)"]:::av
+    AV --> AVb["Q27 · Architecture Path\n(Baseline / Packaging ops / With published apps)"]:::av
+    AVb --> AVc["Q28 · Design Priority\n(Packaging / Assignment / Storage+perf / Governance)"]:::av
+    AVc --> GEN
+
+    %% ── DEM ─────────────────────────────────────────────────────────
+    DEM["Q29 · DEM Scope\n(Profile / Context policies / Printers / All)"]:::dem
+    DEM --> DEMb["Q30 · Architecture Path\n(Baseline / Config ops / Personalization focus)"]:::dem
+    DEMb --> DEMc["Q31 · Design Detail Area\n(Archives / Conditions / Personalization / Ops)"]:::dem
+    DEMc --> GEN
+
+    %% ── WS1 UEM ─────────────────────────────────────────────────────
+    UEM["Q32 · Device Platforms\n(Win+Mac / iOS+Android / All / Rugged)"]:::uem
+    UEM --> UEMb["Q33 · Device Ownership Model\n(Corporate / BYOD / COPE / Mixed)"]:::uem
+    UEMb --> UEMc["Q34 · Security Control Theme\n(Compliance / Patch+vuln / App control)"]:::uem
+    UEMc --> UEMd["Q35 · Architecture Path\n(Baseline / Modern SaaS / Config-first)"]:::uem
+    UEMd --> UEMe["Q36 · Design Section Priority\n(Enrollment / Profiles / App lifecycle / Ops)"]:::uem
+    UEMe --> GEN
+
+    %% ── Omnissa Access ──────────────────────────────────────────────
+    ACC["Q37 · Authentication Baseline\n(Pwd+MFA / Passwordless / Cert / Adaptive)"]:::acc
+    ACC --> ACCb["Q38 · App Catalog Breadth\n(SaaS only / +Virtual / +On-prem web / Unified)"]:::acc
+    ACCb --> ACCc["Q39 · Architecture Path\n(Baseline / Config-first / Zero Trust focus)"]:::acc
+    ACCc --> ACCd["Q40 · Design Section Detail\n(Auth / Directory / Catalog / Policy)"]:::acc
+    ACCd --> GEN
+
+    %% ── UAG ─────────────────────────────────────────────────────────
+    UAG["Q41 · Services Scope\n(Horizon edge / Tunnel+proxy / Content / Combined)"]:::uag
+
+    UAG --> UAG_NIC["NIC · UAG NIC Configuration\n1 NIC  ⚠️  NOT recommended for production\n  port 9443 exposed in DMZ → brute-force risk on admin console\n2 NIC  ✅  Recommended\n  DMZ NIC: 443/8443  ·  Internal NIC: CS + VDI\n3 NIC  ✅  Most secure\n  DMZ NIC  ·  Internal NIC  ·  Management NIC (internal only)"]:::warn
+
+    UAG_NIC --> UAGb["Q42 · Edge Deployment Pattern\n(Single DMZ / Per-site / Global LB)"]:::uag
+    UAGb --> UAGc["Q43 · Architecture Track\n(Baseline / HA / Global LB)"]:::uag
+    UAGc --> UAGd["Q44 · Design Section Priority\n(DMZ placement / Protocol / HA+scale / Security)"]:::uag
+    UAGd --> GEN
+
+    %% ── Document generation ─────────────────────────────────────────
+    GEN([🏁 Generate HLD\nDocument / Presentation]):::gen
+
+    %% ── Styles ──────────────────────────────────────────────────────
+    classDef sel    fill:#48bb78,stroke:#2f855a,color:#fff
+    classDef common fill:#4299e1,stroke:#2b6cb0,color:#fff
+    classDef h8     fill:#ed8936,stroke:#c05621,color:#fff
+    classDef hc     fill:#9f7aea,stroke:#6b46c1,color:#fff
+    classDef av     fill:#f6ad55,stroke:#c05621,color:#1a202c
+    classDef dem    fill:#fc8181,stroke:#c53030,color:#1a202c
+    classDef uem    fill:#63b3ed,stroke:#2b6cb0,color:#1a202c
+    classDef acc    fill:#68d391,stroke:#276749,color:#1a202c
+    classDef uag    fill:#b794f4,stroke:#553c9a,color:#1a202c
+    classDef gen    fill:#1a202c,stroke:#1a202c,color:#fff
+    classDef mfa    fill:#f6e05e,stroke:#d69e2e,color:#1a202c
+    classDef info   fill:#e2e8f0,stroke:#a0aec0,color:#4a5568
+    classDef warn   fill:#fff5f5,stroke:#e53e3e,stroke-width:2px,color:#1a202c
+    </div>
+  </div>
+
+  <script>
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: 'base',
+      themeVariables: {
+        fontSize: '13px',
+        fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif'
+      },
+      flowchart: { curve: 'basis', padding: 20 }
+    });
+  </script>
+</body>
+</html>
