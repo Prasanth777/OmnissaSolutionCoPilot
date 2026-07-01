@@ -14,6 +14,8 @@ class RetrievedChunk:
     title: str
     content: str
     score: float
+    section_title: str = ""
+    section_url: str = ""
 
 
 class AzureFoundryClient:

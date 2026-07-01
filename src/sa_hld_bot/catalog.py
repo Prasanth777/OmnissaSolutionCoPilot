@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 
 TECHZONE_DOMAIN = "techzone.omnissa.com"
 TECHZONE_SITEMAP_URL = f"https://{TECHZONE_DOMAIN}/sitemap.xml"
+UNKNOWN = "Unknown / to be confirmed"
 
 
 @dataclass(frozen=True)
@@ -16,10 +17,12 @@ class Question:
     help_text: str = ""
     options: tuple[str, ...] = ()
     allow_custom: bool = True
-    # show_if: sequence of (answer_key, accepted_value) pairs.
-    # If non-empty the question is shown only when at least one pair matches
-    # the current answers (OR logic).  Empty = always shown.
     show_if: tuple[tuple[str, str], ...] = ()
+    show_if_all: tuple[tuple[str, str], ...] = ()
+    source_title: str = ""
+    source_url: str = ""
+    source_section_title: str = ""
+    source_query: str = ""
 
 
 @dataclass(frozen=True)
@@ -46,146 +49,72 @@ def is_allowed_techzone_url(url: str) -> bool:
     return parsed.scheme in {"http", "https"} and parsed.netloc == TECHZONE_DOMAIN
 
 
+def q(
+    key: str,
+    prompt: str,
+    help_text: str = "",
+    options: tuple[str, ...] = (),
+    allow_custom: bool = True,
+    show_if: tuple[tuple[str, str], ...] = (),
+    show_if_all: tuple[tuple[str, str], ...] = (),
+    source_url: str = "",
+    source_title: str = "",
+) -> Question:
+    return Question(
+        key=key,
+        prompt=prompt,
+        help_text=help_text,
+        options=options,
+        allow_custom=allow_custom,
+        show_if=show_if,
+        show_if_all=show_if_all,
+        source_url=source_url,
+        source_title=source_title,
+    )
+
+
 COMMON_QUESTIONS: tuple[Question, ...] = (
-    Question(
-        "customer_name",
-        "What is the customer name for this HLD?",
-        help_text="Use the legal/entity name you want on the title slide.",
-        options=(),
-        allow_custom=True,
-    ),
-    Question(
-        "industry",
-        "Which industry best matches the customer?",
-        help_text="Pick the closest business domain to tailor architecture language.",
-        options=("Healthcare", "Financial Services", "Manufacturing", "Public Sector", "Retail", "Technology"),
-    ),
-    Question(
-        "project_scope",
-        "What is the primary business objective for this initiative?",
-        help_text="Focus on the most important outcome this design must deliver.",
-        options=("Modernize EUC platform", "Enable secure remote work", "Improve user experience", "Reduce operational cost", "Strengthen security posture"),
-    ),
-    Question(
-        "users_personas",
-        "Which user personas are in scope?",
-        help_text="Choose the dominant end-user profile for sizing and workload patterns.",
-        options=("Task workers", "Knowledge workers", "Developers", "Clinicians", "Contact center users", "Mixed workforce"),
-    ),
-    Question(
-        "hosting_strategy",
-        "What hosting strategy should this design target?",
-        help_text="Select the intended landing zone for management and workloads.",
-        options=("On-premises", "Cloud", "Hybrid"),
-    ),
-    Question(
-        "site_topology",
-        "What is the site topology for this deployment?",
-        help_text="Single site is most common. Multi-site introduces DR and replication considerations.",
-        options=("Single site", "Multi-site"),
-    ),
-    Question(
-        "access_type",
-        "Who needs access to the environment?",
-        help_text="This drives whether UAG, load balancers, and FQDN strategy are required.",
-        options=("Internal users only", "External users only", "Both internal and external"),
-    ),
-    Question(
-        "load_balancer",
-        "Do you have a load balancer available for this deployment?",
-        help_text="Customer-provided. Required for UAG HA and Connection Server redundancy. "
-                  "Without one, high-availability options are limited and custom config is needed.",
-        options=("Yes — F5 / NetScaler / NSX ALB", "Yes — other (specify)", "No load balancer"),
-        allow_custom=True,
-        show_if=(
-            ("access_type", "External users only"),
-            ("access_type", "Both internal and external"),
-        ),
-    ),
-    Question(
-        "fqdn_strategy",
-        "Will you use a single FQDN for both internal and external users?",
-        help_text="Single FQDN requires Split DNS: private DNS resolves to the internal LB IP, "
-                  "public DNS resolves to the UAG / public LB IP.",
-        options=("Yes — single FQDN with Split DNS", "No — separate internal and external URLs"),
-        show_if=(
-            ("access_type", "Both internal and external"),
-        ),
-    ),
-    Question(
-        "cert_type",
-        "What type of SSL certificate will be used?",
-        help_text="UAG acts as a reverse proxy and must terminate TLS — it needs the private key. "
-                  "Format: PFX with private key, or PEM. "
-                  "Wildcard certs need no further URL planning; SAN certs must list UAG, CS, and AppVol URLs.",
-        options=("Wildcard certificate (*.domain.com)", "SAN / multi-domain certificate", "No certificate yet — need to procure"),
-        show_if=(
-            ("access_type", "External users only"),
-            ("access_type", "Both internal and external"),
-        ),
-    ),
-    Question(
-        "identity_source",
-        "What is the identity source for authentication and access?",
-        help_text="Pick the user directory / identity provider used by the customer.",
-        options=("Active Directory", "Entra ID", "Hybrid AD + Entra ID", "LDAP"),
-    ),
-    Question(
-        "network_constraints",
-        "What network posture should we design for?",
-        help_text="Choose the closest access pattern and network constraint profile.",
-        options=("Internal only", "Internal + external users", "Zero Trust internet-first", "Branch office constrained bandwidth"),
-    ),
-    Question(
-        "security_requirements",
-        "Which security baseline is required?",
-        help_text="Select the control profile that best fits compliance and risk expectations.",
-        options=("MFA + conditional access", "Compliance-first (audit heavy)", "Data loss prevention focus", "High security segmentation"),
-    ),
-    Question(
-        "mfa_required",
-        "Is multi-factor authentication (MFA) required?",
-        help_text="MFA placement is determined by your access type: "
-                  "internal-only → configured on Connection Server; "
-                  "external-only → configured on UAG; "
-                  "both → UAG handles external, CS handles internal. "
-                  "If your provider is not natively supported, Workspace ONE Access can be added.",
-        options=("Yes", "No"),
-    ),
-    Question(
-        "mfa_provider",
-        "Which MFA provider is in use?",
-        help_text="SAML-based: Entra ID, Okta, Ping ID (configurable on UAG and CS). "
-                  "RADIUS-based: RSA token / Radius (different protocol — check supported config points).",
-        options=(
-            "Entra ID / Azure AD (SAML)  ~65%",
-            "Okta (SAML)  ~25%",
-            "Radius / RSA token  ~10%",
-            "Ping ID (SAML)  ~5%",
-        ),
-        show_if=(
-            ("mfa_required", "Yes"),
-        ),
-    ),
-    Question(
-        "availability_requirements",
-        "What availability target should the architecture meet?",
-        help_text="Choose the resiliency expectation for management and workload tiers.",
-        options=("Single site", "N+1 within region", "Multi-site active/passive", "Multi-site active/active"),
-    ),
-    Question(
-        "timeline",
-        "What is the expected implementation timeline?",
-        help_text="Use the realistic delivery window to guide phased recommendations.",
-        options=("0-3 months", "3-6 months", "6-12 months", "12+ months"),
-    ),
-    Question(
-        "assumptions",
-        "Any dependencies, assumptions, or constraints we must capture?",
-        help_text="Include known blockers, prerequisites, or external teams/services.",
-        options=(),
-        allow_custom=True,
-    ),
+    q("customer_name", "What is the customer name for this HLD?", "Use the legal/entity name you want on the document.", ()),
+    q("project_name", "What is the project or service name?", "Used on the DOCX cover, headers, and document reference section.", ()),
+    q("document_version", "What document version should appear in the HLD?", "Use the current draft or release version.", ("0.1 - Draft", "0.5 - Review Draft", "1.0 - Final", UNKNOWN)),
+    q("prepared_by", "Who is preparing this HLD?", "Name or team shown in the key contacts and metadata sections.", ()),
+    q("customer_contacts", "Who are the key customer contacts?", "List sponsor, technical owner, security/network contacts, or mark unknown.", (UNKNOWN,)),
+    q("reviewers", "Who should review or approve this design?", "Used in the review and acceptance section.", ("Customer technical approver", "Security/network approver", "Operations approver", UNKNOWN)),
+    q("industry", "Which industry best matches the customer?", "Pick the closest business domain to tailor architecture language.", ("Healthcare", "Financial Services", "Manufacturing", "Public Sector", "Retail", "Technology", UNKNOWN)),
+    q("project_scope", "What is the primary business objective for this initiative?", "Focus on the most important outcome this design must deliver.", ("Modernize EUC platform", "Enable secure remote work", "Improve user experience", "Reduce operational cost", "Strengthen security posture", UNKNOWN)),
+    q("business_drivers", "What are the main business drivers?", "Capture the drivers that should appear in the business requirements table.", ("Support hybrid work", "Replace legacy VDI/app platform", "Improve clinical/user experience", "Improve security and compliance", "Reduce EUC operating cost", UNKNOWN)),
+    q("success_criteria", "What success criteria should the HLD capture?", "Examples: availability target, user experience goal, security approval, migration outcome.", ("Stable remote access", "Improved login and launch experience", "High availability for critical users", "Security/compliance approval", "Operational handover ready", UNKNOWN)),
+    q("in_scope", "What is in scope for this HLD?", "List products, user groups, sites, workloads, or integration areas.", ("Core Horizon platform", "External access", "Application delivery", "User environment management", "Operations and DR", UNKNOWN)),
+    q("out_of_scope", "What is explicitly out of scope?", "This prevents the HLD from implying ownership of unrelated work.", ("Endpoint refresh", "Application remediation", "Network redesign", "Identity tenant redesign", "Detailed implementation runbook", UNKNOWN)),
+    q("users_personas", "Which user personas are in scope?", "Choose the dominant end-user profile for sizing and workload patterns.", ("Task workers", "Knowledge workers", "Developers", "Clinicians", "Contact center users", "Mixed workforce", UNKNOWN)),
+    q("workload_concurrency", "What is the expected user scale or concurrency?", "Use a number, range, or unknown so sizing tables can be populated honestly.", ("Up to 500 concurrent users", "500-2,000 concurrent users", "2,000+ concurrent users", UNKNOWN)),
+    q("hosting_strategy", "What hosting strategy should this design target?", "Select the intended landing zone for management and workloads.", ("On-premises", "Cloud", "Hybrid", UNKNOWN)),
+    q("site_topology", "What is the site topology for this deployment?", "Single site is most common. Multi-site introduces DR and replication considerations.", ("Single site", "Multi-site", UNKNOWN)),
+    q("primary_site", "What is the primary site or region?", "Used in site topology, networking, and recovery sections.", (UNKNOWN,)),
+    q("secondary_sites", "What secondary sites, branches, or DR regions are in scope?", "List site names/regions or mark unknown.", ("Not applicable", UNKNOWN), show_if=(("site_topology", "Multi-site"),)),
+    q("access_type", "Who needs access to the environment?", "This drives whether UAG, load balancers, and FQDN strategy are required.", ("Internal users only", "External users only", "Both internal and external", UNKNOWN)),
+    q("load_balancer", "Do you have a load balancer available for this deployment?", "Required for UAG HA and Connection Server redundancy.", ("Yes - F5 / NetScaler / NSX ALB", "Yes - other (specify)", "No load balancer", UNKNOWN), show_if=(("access_type", "External users only"), ("access_type", "Both internal and external"))),
+    q("fqdn_strategy", "Will you use a single FQDN for both internal and external users?", "Single FQDN requires Split DNS between internal and public resolution.", ("Yes - single FQDN with Split DNS", "No - separate internal and external URLs", UNKNOWN), show_if=(("access_type", "Both internal and external"),)),
+    q("cert_type", "What type of SSL certificate will be used?", "UAG terminates TLS and needs the private key.", ("Wildcard certificate (*.domain.com)", "SAN / multi-domain certificate", "No certificate yet - need to procure", UNKNOWN), show_if=(("access_type", "External users only"), ("access_type", "Both internal and external"))),
+    q("certificate_owner", "Who owns certificate procurement and renewal?", "Used in security and operations responsibilities.", ("Customer security team", "Customer network team", "Managed service provider", UNKNOWN), show_if=(("access_type", "External users only"), ("access_type", "Both internal and external"))),
+    q("identity_source", "What is the identity source for authentication and access?", "Pick the user directory / identity provider used by the customer.", ("Active Directory", "Entra ID", "Hybrid AD + Entra ID", "LDAP", UNKNOWN)),
+    q("dns_dhcp_ntp", "What DNS, DHCP, and NTP assumptions should be captured?", "Examples: enterprise DNS, DHCP scopes, split DNS, NTP source.", ("Existing enterprise DNS/DHCP/NTP", "New DNS/DHCP entries required", "Split DNS required", UNKNOWN)),
+    q("network_segments", "Which network segments, VLANs, or subnets are relevant?", "Used for networking requirements and open items. Exact IPs can be omitted.", ("Management", "DMZ", "VDI workloads", "RDSH workloads", "User/endpoint networks", UNKNOWN)),
+    q("firewall_ports", "What firewall or port assumptions should be noted?", "Capture known firewall boundaries or Tech Zone port guidance.", ("Use Omnissa Tech Zone Horizon port guidance", "Internal firewall review required", "External/DMZ firewall review required", UNKNOWN)),
+    q("security_requirements", "Which security baseline is required?", "Select the control profile that best fits compliance and risk expectations.", ("MFA + conditional access", "Compliance-first (audit heavy)", "Data loss prevention focus", "High security segmentation", UNKNOWN)),
+    q("mfa_required", "Is multi-factor authentication (MFA) required?", "Internal uses Connection Server, external uses UAG; non-native providers may add Access.", ("Yes", "No", UNKNOWN)),
+    q("mfa_provider", "Which MFA provider is in use?", "SAML-based and RADIUS providers follow different integration patterns.", ("Entra ID / Azure AD (SAML)", "Okta (SAML)", "RADIUS / RSA token", "Ping ID (SAML)", UNKNOWN), show_if=(("mfa_required", "Yes"),)),
+    q("availability_requirements", "What availability target should the architecture meet?", "Choose the resiliency expectation for management and workload tiers.", ("Single site", "N+1 within region", "Multi-site active/passive", "Multi-site active/active", UNKNOWN)),
+    q("backup_requirements", "What backup expectations should the HLD include?", "Capture platform backup responsibilities and any recovery expectations.", ("Backup Horizon configuration and databases", "Backup golden images/templates", "Customer backup platform to be used", UNKNOWN)),
+    q("dr_scenarios", "Which disaster recovery scenarios should be covered?", "Used in the business continuity and recovery section.", ("Single component failure", "Site failure", "Cloud/service dependency outage", "Network edge failure", UNKNOWN)),
+    q("operations_owner", "Who will operate the platform after deployment?", "Used in operational model and acceptance sections.", ("Customer EUC operations", "Customer infrastructure operations", "Managed service provider", "Shared operations model", UNKNOWN)),
+    q("monitoring_logging", "What monitoring and logging approach should be captured?", "Examples: Horizon monitoring, SIEM integration, event database, log retention.", ("Horizon/Event database monitoring", "SIEM integration required", "Existing monitoring platform", UNKNOWN)),
+    q("rbac_model", "What RBAC or administration model should be used?", "Used in the security standards section.", ("Least privilege role groups", "Separate operations and security roles", "Customer standard admin groups", UNKNOWN)),
+    q("antivirus_hardening", "What antivirus or hardening requirements should be captured?", "Examples: AV exclusions, security baseline, image hardening.", ("Use Omnissa recommended exclusions", "Customer AV baseline applies", "Security hardening review required", UNKNOWN)),
+    q("risks", "What risks should the HLD call out?", "List risks such as missing network details, certificate readiness, sizing uncertainty, or dependency owners.", ("Network/firewall dependencies", "Certificate readiness", "Sizing assumptions not validated", "Identity/MFA dependency", UNKNOWN)),
+    q("constraints", "What constraints should the HLD call out?", "Capture constraints such as timelines, platform standards, limited bandwidth, or procurement dependencies.", ("Existing network architecture", "Customer security standards", "Procurement/timeline dependency", "Limited branch bandwidth", UNKNOWN)),
+    q("open_items", "What open items remain to be confirmed?", "These will appear as open design items rather than guessed content.", ("IP addressing/subnets", "FQDNs and certificates", "Load balancer VIPs", "Final sizing", UNKNOWN)),
+    q("assumptions", "Any dependencies, assumptions, or constraints we must capture?", "Include known blockers, prerequisites, or external teams/services.", ("Customer will provide required network services", "Customer will provide certificates", "Firewall rules will follow Tech Zone guidance", UNKNOWN)),
 )
 
 
@@ -194,492 +123,145 @@ HORIZON_8 = Product(
     title="Horizon 8",
     family="Horizon",
     summary="Customer-managed Horizon deployment for VDI and published applications.",
-    resource=Resource(
-        title="What Is Omnissa Horizon?",
-        url="https://techzone.omnissa.com/resource/what-omnissa-horizon",
-        summary="Horizon product family introduction and selection guidance.",
-    ),
+    resource=Resource("What Is Omnissa Horizon?", "https://techzone.omnissa.com/resource/what-omnissa-horizon", "Horizon product family introduction and selection guidance."),
     related_resources=(
-        Resource(
-            title="Horizon 8 Architecture",
-            url="https://techzone.omnissa.com/resource/horizon-8-architecture",
-            summary="Core Horizon 8 architecture design guidance.",
-        ),
-        Resource(
-            title="Horizon 8 on VMware Cloud on AWS Architecture",
-            url="https://techzone.omnissa.com/resource/horizon-8-vmware-cloud-aws-architecture",
-            summary="Reference architecture for Horizon 8 on VMware Cloud on AWS.",
-        ),
-        Resource(
-            title="Horizon 8 on Azure VMware Solution Architecture",
-            url="https://techzone.omnissa.com/resource/horizon-8-azure-vmware-solution-architecture",
-            summary="Reference architecture for Horizon 8 on AVS.",
-        ),
-        Resource(
-            title="Horizon 8 on Google Cloud VMware Engine Architecture",
-            url="https://techzone.omnissa.com/resource/horizon-8-google-cloud-vmware-engine-architecture",
-            summary="Reference architecture for Horizon 8 on GCVE.",
-        ),
-        Resource(
-            title="Horizon 8 on Oracle Cloud VMware Solution Architecture",
-            url="https://techzone.omnissa.com/resource/horizon-8-oracle-cloud-vmware-solution-architecture",
-            summary="Reference architecture for Horizon 8 on OCVS.",
-        ),
-        Resource(
-            title="Horizon 8 on Alibaba Cloud VMware Service Architecture",
-            url="https://techzone.omnissa.com/resource/horizon-8-alibaba-cloud-vmware-service-architecture",
-            summary="Reference architecture for Horizon 8 on ACVS.",
-        ),
-        Resource(
-            title="Unified Access Gateway Architecture",
-            url="https://techzone.omnissa.com/resource/unified-access-gateway-architecture",
-            summary="Secure remote access architecture patterns for Horizon and Workspace ONE.",
-        ),
+        Resource("Horizon 8 Architecture", "https://techzone.omnissa.com/resource/horizon-8-architecture", "Core Horizon 8 architecture design guidance."),
+        Resource("Horizon 8 Configuration", "https://techzone.omnissa.com/resource/horizon-8-configuration", "Horizon 8 configuration guidance."),
+        Resource("Reference Architecture VM Specifications", "https://techzone.omnissa.com/resource/reference-architecture-vm-specifications", "VM sizing and reference specifications."),
+        Resource("Network Ports in Horizon 8", "https://techzone.omnissa.com/resource/network-ports-horizon-8", "Network and firewall port guidance."),
+        Resource("Unified Access Gateway Architecture", "https://techzone.omnissa.com/resource/unified-access-gateway-architecture", "Secure remote access architecture patterns."),
+        Resource("Horizon 8 on VMware Cloud on AWS Architecture", "https://techzone.omnissa.com/resource/horizon-8-vmware-cloud-aws-architecture", "Reference architecture for Horizon 8 on VMC on AWS."),
+        Resource("Horizon 8 on Azure VMware Solution Architecture", "https://techzone.omnissa.com/resource/horizon-8-azure-vmware-solution-architecture", "Reference architecture for Horizon 8 on AVS."),
+        Resource("Horizon 8 on Google Cloud VMware Engine Architecture", "https://techzone.omnissa.com/resource/horizon-8-google-cloud-vmware-engine-architecture", "Reference architecture for Horizon 8 on GCVE."),
+        Resource("Horizon 8 on Oracle Cloud VMware Solution Architecture", "https://techzone.omnissa.com/resource/horizon-8-oracle-cloud-vmware-solution-architecture", "Reference architecture for Horizon 8 on OCVS."),
+        Resource("Horizon 8 on Alibaba Cloud VMware Service Architecture", "https://techzone.omnissa.com/resource/horizon-8-alibaba-cloud-vmware-service-architecture", "Reference architecture for Horizon 8 on ACVS."),
     ),
     follow_up_questions=(
-        Question(
-            "horizon_use_cases",
-            "Which Horizon 8 workloads are required?",
-            help_text="Select the primary desktop/app delivery pattern.",
-            options=("Pooled VDI", "Persistent VDI", "Published apps", "Mixed VDI + published apps"),
-        ),
-        Question(
-            "horizon_capacity",
-            "What is the expected peak concurrent user load?",
-            help_text="Choose your best estimate for concurrent sessions.",
-            options=("Up to 500", "500-2,000", "2,000-10,000", "10,000+"),
-        ),
-        Question(
-            "horizon_image_strategy",
-            "Which image/application delivery strategy should be used?",
-            help_text="Pick the preferred desktop image and app lifecycle model.",
-            options=("Instant Clone + golden image", "Persistent desktops", "App layering with App Volumes"),
-        ),
-        Question(
-            "horizon_external_access",
-            "How should external access be handled?",
-            help_text="Select the edge access model for remote users.",
-            options=("No external access", "UAG in DMZ", "UAG + load balancer", "Zero Trust edge"),
-        ),
-        Question(
-            "horizon_access_topology",
-            "Which remote access topology best fits the customer?",
-            help_text="This helps choose the right external access diagrams for the deck.",
-            options=("Without load balancer", "With load balancer", "Global load-balanced edge"),
-        ),
-        Question(
-            "horizon_dmz_design",
-            "Which DMZ design should the client presentation cover?",
-            help_text="Choose the edge security layout the customer is most likely to adopt.",
-            options=("Single DMZ", "Double DMZ", "Per-site DMZ pair", "No DMZ / internal only"),
-        ),
-        Question(
-            "horizon_protocol_scope",
-            "Which display protocols should the network section cover?",
-            help_text="Pick only the protocols that are relevant so the PPT stays focused.",
-            options=("Blast Extreme only", "Blast + PCoIP", "Blast + PCoIP + RDP"),
-        ),
-        Question(
-            "horizon_8_arch_track",
-            "Which Horizon 8 architecture path best matches your target platform?",
-            help_text="Pick the exact architecture track so the deck can align to the right Tech Zone reference diagrams.",
-            options=(
-                "Horizon 8 core architecture",
-                "Horizon 8 on VMware Cloud on AWS",
-                "Horizon 8 on Azure VMware Solution",
-                "Horizon 8 on Google Cloud VMware Engine",
-                "Horizon 8 on Oracle Cloud VMware Solution",
-                "Horizon 8 on Alibaba Cloud VMware Service",
-            ),
-        ),
-        Question(
-            "horizon_8_design_focus",
-            "Which Horizon 8 design section should be prioritized?",
-            help_text="Select the section where you want the most detailed architecture decisions in the HLD.",
-            options=(
-                "Management components and control plane",
-                "Desktop/RDS host workload pools",
-                "Network, UAG, and edge access",
-                "Availability, scale, and DR",
-            ),
-        ),
+        q("horizon_use_cases", "Which Horizon 8 workloads are required?", "Select the primary desktop/app delivery pattern.", ("Pooled VDI", "Persistent VDI", "Published apps", "Mixed VDI + published apps", UNKNOWN)),
+        q("horizon_pool_model", "What desktop or RDSH pool model should be captured?", "Used in the Horizon desktops and RDSH design tables.", ("Instant clone non-persistent desktops", "Persistent desktops", "RDSH farms", "Mixed desktop and RDSH pools", UNKNOWN)),
+        q("horizon_pod_block_model", "Which Horizon pod and block model should the HLD assume?", "This drives pod/block, single-site, and multi-site architecture diagrams.", ("Single-site scaled pod", "Multi-site pod architecture", "Cloud Pod Architecture", UNKNOWN)),
+        q("horizon_connection_server_count", "How many Horizon Connection Servers are planned per pod or site?", "Use a count/range or mark unknown.", ("2 per pod/site", "3+ per pod/site", UNKNOWN)),
+        q("horizon_external_access", "How should external access be handled?", "Select the edge access model for remote users.", ("No external access", "UAG in DMZ", "UAG + load balancer", "Zero Trust edge", UNKNOWN), show_if=(("access_type", "External users only"), ("access_type", "Both internal and external"))),
+        q("horizon_access_topology", "Which remote access topology best fits the customer?", "This helps choose the right external access diagrams.", ("Without load balancer", "With load balancer", "Global load-balanced edge", UNKNOWN), show_if=(("access_type", "External users only"), ("access_type", "Both internal and external"))),
+        q("horizon_dmz_design", "Which DMZ design should the client presentation cover?", "Choose the edge security layout.", ("Single DMZ", "Double DMZ", "Per-site DMZ pair", "No DMZ / internal only", UNKNOWN), show_if=(("access_type", "External users only"), ("access_type", "Both internal and external"))),
+        q("horizon_protocol_scope", "Which display protocols should the network section cover?", "Pick only relevant display protocols.", ("Blast Extreme only", "Blast + PCoIP", "Blast + PCoIP + RDP", UNKNOWN)),
+        q("horizon_8_arch_track", "Which Horizon 8 architecture path best matches your target platform?", "Align to the right Tech Zone architecture.", ("Horizon 8 core architecture", "Horizon 8 on VMware Cloud on AWS", "Horizon 8 on Azure VMware Solution", "Horizon 8 on Google Cloud VMware Engine", "Horizon 8 on Oracle Cloud VMware Solution", "Horizon 8 on Alibaba Cloud VMware Service", UNKNOWN)),
+        q("horizon_8_design_focus", "Which Horizon 8 design section should be prioritized?", "Select the section where you want the most detail.", ("Management components and control plane", "Desktop/RDS host workload pools", "Network, UAG, and edge access", "Availability, scale, and DR", UNKNOWN)),
+        q("horizon_database_events", "What Horizon event database approach should be captured?", "Used in integration and operations sections.", ("Existing SQL platform", "New SQL database", "Not required for this phase", UNKNOWN)),
+        q("horizon_golden_image", "What golden image or parent VM strategy should be captured?", "Used in desktop/RDSH build and operations sections.", ("Single standard golden image", "Separate desktop and RDSH images", "Customer-managed image lifecycle", UNKNOWN)),
     ),
 )
+
 
 HORIZON_CLOUD = Product(
     key="horizon_cloud",
     title="Horizon Cloud",
     family="Horizon",
     summary="Cloud-delivered desktop and app service with Horizon control plane.",
-    resource=Resource(
-        title="What Is Omnissa Horizon?",
-        url="https://techzone.omnissa.com/resource/what-omnissa-horizon",
-        summary="Overview that positions Horizon Cloud and Horizon 8.",
-    ),
+    resource=Resource("What Is Omnissa Horizon?", "https://techzone.omnissa.com/resource/what-omnissa-horizon", "Horizon product family context."),
     related_resources=(
-        Resource(
-            title="Horizon Cloud Service Next-Gen Architecture",
-            url="https://techzone.omnissa.com/resource/horizon-cloud-service-next-gen-architecture",
-            summary="Reference architecture for Horizon Cloud Service next-gen.",
-        ),
-        Resource(
-            title="Horizon Cloud Service Next-Gen Configuration",
-            url="https://techzone.omnissa.com/resource/horizon-cloud-service-next-gen-configuration",
-            summary="Configuration patterns for Horizon Cloud Service next-gen.",
-        ),
-        Resource(
-            title="Horizon Cloud Service Security Overview",
-            url="https://techzone.omnissa.com/resource/horizon-cloud-service-security-overview",
-            summary="Security and responsibility model for Horizon Cloud service.",
-        ),
+        Resource("Horizon Cloud Service Next-Gen Architecture", "https://techzone.omnissa.com/resource/horizon-cloud-service-next-gen-architecture", "Next-gen Horizon Cloud reference architecture."),
+        Resource("Horizon Cloud Service Next-Gen Configuration", "https://techzone.omnissa.com/resource/horizon-cloud-service-next-gen-configuration", "Configuration patterns."),
+        Resource("Horizon Cloud Service Security Overview", "https://techzone.omnissa.com/resource/horizon-cloud-service-security-overview", "Security overview."),
     ),
     follow_up_questions=(
-        Question(
-            "horizon_cloud_provider",
-            "Which cloud platform will host Horizon Cloud workloads?",
-            help_text="Choose the primary hyperscaler target for deployment.",
-            options=("Microsoft Azure", "AWS", "Google Cloud"),
-        ),
-        Question(
-            "horizon_cloud_use_cases",
-            "What is the main Horizon Cloud adoption scenario?",
-            help_text="Pick the primary reason for using Horizon Cloud.",
-            options=("DaaS migration", "Cloud burst", "Net new desktop service", "Hybrid control plane"),
-        ),
-        Question(
-            "horizon_cloud_connectivity",
-            "Which connectivity architecture is preferred?",
-            help_text="Select the expected network interconnect model to cloud.",
-            options=("Private connectivity", "Internet + UAG", "Hub-and-spoke network"),
-        ),
-        Question(
-            "horizon_cloud_arch_track",
-            "Which Horizon Cloud architecture track should we follow?",
-            help_text="Choose the cloud architecture baseline for solution decisions.",
-            options=(
-                "Horizon Cloud next-gen architecture",
-                "Horizon Cloud security architecture focus",
-                "Horizon Cloud connectivity-first architecture",
-            ),
-        ),
-        Question(
-            "horizon_cloud_design_focus",
-            "Which Horizon Cloud section needs the deepest design detail?",
-            help_text="Pick the section where you want stronger solution depth in the HLD.",
-            options=(
-                "Pod/control plane and tenant model",
-                "Desktop/app workload delivery",
-                "Identity and access integration",
-                "Operations, monitoring, and resilience",
-            ),
-        ),
+        q("horizon_cloud_provider", "Which cloud platform will host Horizon Cloud workloads?", "Choose the primary hyperscaler target.", ("Microsoft Azure", "AWS", "Google Cloud", UNKNOWN)),
+        q("horizon_cloud_use_cases", "What is the main Horizon Cloud adoption scenario?", "Pick the primary reason for using Horizon Cloud.", ("DaaS migration", "Cloud burst", "Net new desktop service", "Hybrid control plane", UNKNOWN)),
+        q("horizon_cloud_connectivity", "Which connectivity architecture is preferred?", "Select the expected network interconnect model.", ("Private connectivity", "Internet + UAG", "Hub-and-spoke network", UNKNOWN)),
+        q("horizon_cloud_arch_track", "Which Horizon Cloud architecture track should we follow?", "Choose the baseline for solution decisions.", ("Horizon Cloud next-gen architecture", "Horizon Cloud security architecture focus", "Horizon Cloud connectivity-first architecture", UNKNOWN)),
+        q("horizon_cloud_design_focus", "Which Horizon Cloud section needs the deepest design detail?", "Pick the section requiring stronger depth.", ("Pod/control plane and tenant model", "Desktop/app workload delivery", "Identity and access integration", "Operations, monitoring, and resilience", UNKNOWN)),
     ),
 )
+
 
 APP_VOLUMES = Product(
     key="app_volumes",
     title="App Volumes",
     family="Horizon",
     summary="Application packaging and dynamic delivery for VDI/app sessions.",
-    resource=Resource(
-        title="What Is Omnissa App Volumes?",
-        url="https://techzone.omnissa.com/resource/what-omnissa-app-volumes",
-        summary="App Volumes overview and design considerations.",
-    ),
-    related_resources=(
-        Resource(
-            title="App Volumes Architecture",
-            url="https://techzone.omnissa.com/resource/app-volumes-architecture",
-            summary="Reference architecture for App Volumes.",
-        ),
-    ),
+    resource=Resource("What Is Omnissa App Volumes?", "https://techzone.omnissa.com/resource/what-omnissa-app-volumes", "App Volumes overview."),
+    related_resources=(Resource("App Volumes Architecture", "https://techzone.omnissa.com/resource/app-volumes-architecture", "Reference architecture for App Volumes."),),
     follow_up_questions=(
-        Question(
-            "app_volumes_scope",
-            "How do you plan to use App Volumes?",
-            help_text="Select the dominant app delivery/lifecycle use case.",
-            options=("App attach for non-persistent VDI", "Dynamic app entitlements", "Lifecycle simplification"),
-        ),
-        Question(
-            "app_volumes_arch_track",
-            "Which App Volumes architecture path best fits this project?",
-            help_text="Choose the architecture/design baseline for packaging and delivery.",
-            options=(
-                "App Volumes architecture baseline",
-                "App Volumes packaging and lifecycle operations",
-                "App Volumes with Horizon published apps on-demand",
-            ),
-        ),
-        Question(
-            "app_volumes_design_focus",
-            "Which App Volumes section should be prioritized?",
-            help_text="Pick the area where detailed design guidance is most needed.",
-            options=(
-                "Application packaging and capture",
-                "Assignment and entitlement model",
-                "Storage/performance and scale",
-                "Operational governance and lifecycle",
-            ),
-        ),
+        q("app_volumes_scope", "How do you plan to use App Volumes?", "Select the dominant app delivery/lifecycle use case.", ("App attach for non-persistent VDI", "Dynamic app entitlements", "Lifecycle simplification", UNKNOWN)),
+        q("app_volumes_arch_track", "Which App Volumes architecture path best fits this project?", "Choose the architecture/design baseline.", ("App Volumes architecture baseline", "App Volumes packaging and lifecycle operations", "App Volumes with Horizon published apps on-demand", UNKNOWN)),
+        q("app_volumes_design_focus", "Which App Volumes section should be prioritized?", "Pick the area where detailed design guidance is most needed.", ("Application packaging and capture", "Assignment and entitlement model", "Storage/performance and scale", "Operational governance and lifecycle", UNKNOWN)),
+        q("app_volumes_storage", "What App Volumes storage approach should be captured?", "Used in storage group and package delivery design tables.", ("Shared vSphere datastore", "Replicated datastore per site", "Storage groups", UNKNOWN)),
+        q("app_volumes_database", "What App Volumes database approach should be captured?", "Used in App Volumes component and availability tables.", ("Existing SQL platform", "SQL Always On / HA database", "New standalone SQL database", UNKNOWN)),
     ),
 )
+
 
 DEM = Product(
     key="dynamic_environment_manager",
     title="Dynamic Environment Manager",
     family="Horizon",
     summary="Context-aware user profile and environment policy management.",
-    resource=Resource(
-        title="What Is Omnissa Horizon?",
-        url="https://techzone.omnissa.com/resource/what-omnissa-horizon",
-        summary="Horizon portfolio context including DEM.",
-    ),
-    related_resources=(
-        Resource(
-            title="Dynamic Environment Manager Architecture",
-            url="https://techzone.omnissa.com/resource/dynamic-environment-manager-architecture",
-            summary="Reference architecture for Dynamic Environment Manager.",
-        ),
-    ),
+    resource=Resource("Dynamic Environment Manager Architecture", "https://techzone.omnissa.com/resource/dynamic-environment-manager-architecture", "DEM reference architecture."),
+    related_resources=(Resource("What Is Omnissa Horizon?", "https://techzone.omnissa.com/resource/what-omnissa-horizon", "Horizon portfolio context including DEM."),),
     follow_up_questions=(
-        Question(
-            "dem_scope",
-            "What should DEM primarily manage?",
-            help_text="Pick the most important user environment policy scope.",
-            options=("Profile management", "Context-based policies", "Printer and drive mapping", "All of the above"),
-        ),
-        Question(
-            "dem_arch_track",
-            "Which DEM architecture/design path should we use?",
-            help_text="Choose the best-fit track for user environment management decisions.",
-            options=(
-                "DEM architecture baseline",
-                "DEM configuration and policy operations",
-                "DEM with app personalization focus",
-            ),
-        ),
-        Question(
-            "dem_design_focus",
-            "Which DEM section should be designed in detail?",
-            help_text="Pick the area requiring deepest implementation planning.",
-            options=(
-                "Profile archives and configuration shares",
-                "Context-based conditions and policies",
-                "User personalization and app settings",
-                "Operations and troubleshooting",
-            ),
-        ),
+        q("dem_scope", "What should DEM primarily manage?", "Pick the most important user environment policy scope.", ("Profile management", "Context-based policies", "Printer and drive mapping", "All of the above", UNKNOWN)),
+        q("dem_arch_track", "Which DEM architecture/design path should we use?", "Choose the best-fit track for user environment management.", ("DEM architecture baseline", "DEM configuration and policy operations", "DEM with app personalization focus", UNKNOWN)),
+        q("dem_design_focus", "Which DEM section should be designed in detail?", "Pick the area requiring deepest implementation planning.", ("Profile archives and configuration shares", "Context-based conditions and policies", "User personalization and app settings", "Operations and troubleshooting", UNKNOWN)),
+        q("dem_file_shares", "What DEM file share approach should be captured?", "Used for configuration share, profile archive share, and multi-site design.", ("Existing SMB file servers", "New highly available SMB shares", "Per-site shares with replication", UNKNOWN)),
+        q("dem_profile_strategy", "What user profile strategy should be captured?", "Used in DEM and FSLogix design sections.", ("DEM profile archives", "FSLogix profile containers", "DEM + FSLogix", UNKNOWN)),
     ),
 )
+
 
 WORKSPACE_ONE_UEM = Product(
     key="workspace_one_uem",
     title="Workspace ONE UEM",
     family="Workspace ONE",
     summary="Unified endpoint management across modern device platforms.",
-    resource=Resource(
-        title="What Is Workspace ONE?",
-        url="https://techzone.omnissa.com/resource/what-workspace-one",
-        summary="Workspace ONE platform and UEM overview.",
-    ),
-    related_resources=(
-        Resource(
-            title="Workspace ONE UEM Architecture",
-            url="https://techzone.omnissa.com/resource/workspace-one-uem-architecture",
-            summary="Reference architecture for Workspace ONE UEM.",
-        ),
-    ),
+    resource=Resource("What Is Workspace ONE?", "https://techzone.omnissa.com/resource/what-workspace-one", "Workspace ONE platform overview."),
+    related_resources=(Resource("Workspace ONE UEM Architecture", "https://techzone.omnissa.com/resource/workspace-one-uem-architecture", "Reference architecture for Workspace ONE UEM."),),
     follow_up_questions=(
-        Question(
-            "uem_platforms",
-            "Which device platforms are in scope for UEM?",
-            help_text="Choose the platform mix you need to manage.",
-            options=("Windows + macOS", "iOS + Android", "All major platforms", "Rugged/shared devices"),
-        ),
-        Question(
-            "uem_ownership",
-            "What is the device ownership model?",
-            help_text="Select the endpoint ownership pattern used by the customer.",
-            options=("Corporate-owned", "BYOD", "COPE", "Mixed"),
-        ),
-        Question(
-            "uem_security",
-            "Which UEM security control theme matters most?",
-            help_text="Choose the strongest management/security priority for endpoints.",
-            options=("Compliance + conditional launch", "Patch and vulnerability baseline", "Application control"),
-        ),
-        Question(
-            "uem_arch_track",
-            "Which Workspace ONE UEM architecture path should guide this HLD?",
-            help_text="Choose the architecture/design baseline to align solution recommendations.",
-            options=(
-                "Workspace ONE UEM architecture baseline",
-                "Workspace ONE UEM modern SaaS architecture",
-                "Workspace ONE UEM configuration-first path",
-            ),
-        ),
-        Question(
-            "uem_design_focus",
-            "Which UEM design section should be prioritized?",
-            help_text="Pick the section that needs the strongest technical depth.",
-            options=(
-                "Enrollment and onboarding workflows",
-                "Profiles, compliance, and conditional controls",
-                "Application lifecycle and software distribution",
-                "Operations, reporting, and governance",
-            ),
-        ),
+        q("uem_platforms", "Which device platforms are in scope for UEM?", "Choose the platform mix you need to manage.", ("Windows + macOS", "iOS + Android", "All major platforms", "Rugged/shared devices", UNKNOWN)),
+        q("uem_ownership", "What is the device ownership model?", "Select the endpoint ownership pattern used by the customer.", ("Corporate-owned", "BYOD", "COPE", "Mixed", UNKNOWN)),
+        q("uem_security", "Which UEM security control theme matters most?", "Choose the strongest management/security priority.", ("Compliance + conditional launch", "Patch and vulnerability baseline", "Application control", UNKNOWN)),
+        q("uem_arch_track", "Which Workspace ONE UEM architecture path should guide this HLD?", "Choose the architecture/design baseline.", ("Workspace ONE UEM architecture baseline", "Workspace ONE UEM modern SaaS architecture", "Workspace ONE UEM configuration-first path", UNKNOWN)),
+        q("uem_design_focus", "Which UEM design section should be prioritized?", "Pick the section that needs the strongest technical depth.", ("Enrollment and onboarding workflows", "Profiles, compliance, and conditional controls", "Application lifecycle and software distribution", "Operations, reporting, and governance", UNKNOWN)),
     ),
 )
+
 
 OMNISSA_ACCESS = Product(
     key="omnissa_access",
     title="Omnissa Access",
     family="Workspace ONE",
     summary="Identity, SSO, conditional access, and app catalog services.",
-    resource=Resource(
-        title="What Is Workspace ONE?",
-        url="https://techzone.omnissa.com/resource/what-workspace-one",
-        summary="Workspace ONE identity and access context.",
-    ),
-    related_resources=(
-        Resource(
-            title="Workspace ONE Access Architecture",
-            url="https://techzone.omnissa.com/resource/workspace-one-access-architecture",
-            summary="Reference architecture for Workspace ONE Access.",
-        ),
-        Resource(
-            title="Workspace ONE Access Configuration",
-            url="https://techzone.omnissa.com/resource/workspace-one-access-configuration",
-            summary="Configuration reference for Workspace ONE Access.",
-        ),
-    ),
+    resource=Resource("Workspace ONE Access Architecture", "https://techzone.omnissa.com/resource/workspace-one-access-architecture", "Reference architecture for Workspace ONE Access."),
+    related_resources=(Resource("Workspace ONE Access Configuration", "https://techzone.omnissa.com/resource/workspace-one-access-configuration", "Configuration reference."),),
     follow_up_questions=(
-        Question(
-            "access_authentication",
-            "What authentication baseline should Access enforce?",
-            help_text="Pick the preferred sign-in strength and user experience.",
-            options=("Password + MFA", "Passwordless + MFA", "Certificate-based auth", "Adaptive auth"),
-        ),
-        Question(
-            "access_catalog",
-            "How broad should the app catalog be?",
-            help_text="Select which app classes should be unified in the user catalog.",
-            options=("SaaS only", "SaaS + virtual apps", "SaaS + on-prem web apps", "Unified catalog all apps"),
-        ),
-        Question(
-            "access_arch_track",
-            "Which Access architecture path should this solution follow?",
-            help_text="Choose the identity architecture baseline for the HLD.",
-            options=(
-                "Workspace ONE Access architecture baseline",
-                "Workspace ONE Access configuration-first path",
-                "Access with Zero Trust conditional access focus",
-            ),
-        ),
-        Question(
-            "access_design_focus",
-            "Which Access section should be designed in detail?",
-            help_text="Pick the area where deeper identity/access architecture is required.",
-            options=(
-                "Authentication and MFA patterns",
-                "Directory sync and identity source integration",
-                "Application catalog and federation",
-                "Access policy, risk, and compliance controls",
-            ),
-        ),
+        q("access_authentication", "Which authentication pattern should Omnissa Access support?", "Choose the primary identity pattern.", ("SAML federation", "MFA and conditional access", "Certificate-based access", "Passwordless / modern auth", UNKNOWN)),
+        q("access_catalog", "Which app catalog scope is required?", "Select app presentation requirements.", ("SaaS/web apps", "Virtual apps from Horizon", "Unified catalog all apps", UNKNOWN)),
+        q("access_arch_track", "Which Access architecture path should guide the HLD?", "Choose architecture/configuration baseline.", ("Workspace ONE Access architecture baseline", "Workspace ONE Access configuration-first path", "Zero Trust and conditional access focus", UNKNOWN)),
+        q("access_design_focus", "Which Access design section should be prioritized?", "Pick the area requiring strongest depth.", ("Authentication methods", "Directory sync and identity source", "Application catalog and virtual apps", "Access policies and compliance", UNKNOWN)),
     ),
 )
+
 
 UAG = Product(
     key="unified_access_gateway",
     title="Unified Access Gateway",
     family="Workspace ONE",
-    summary="Secure edge gateway for remote access to Horizon and Workspace ONE services.",
-    resource=Resource(
-        title="Unified Access Gateway Architecture",
-        url="https://techzone.omnissa.com/resource/unified-access-gateway-architecture",
-        summary="Reference architecture for DMZ edge and remote access.",
-    ),
+    summary="Secure edge access for Horizon and Workspace ONE services.",
+    resource=Resource("Unified Access Gateway Architecture", "https://techzone.omnissa.com/resource/unified-access-gateway-architecture", "UAG architecture patterns."),
     related_resources=(
-        Resource(
-            title="Deploying Unified Access Gateway",
-            url="https://techzone.omnissa.com/resource/deploying-unified-access-gateway",
-            summary="Deployment guidance for Unified Access Gateway.",
-        ),
-        Resource(
-            title="Configuring High Availability for Unified Access Gateway",
-            url="https://techzone.omnissa.com/resource/configuring-high-availability-unified-access-gateway",
-            summary="High-availability architecture guidance for UAG.",
-        ),
-        Resource(
-            title="Load Balancing UAG for Horizon",
-            url="https://techzone.omnissa.com/resource/load-balancing-unified-access-gateway-horizon",
-            summary="Load balancing and scale design patterns for UAG.",
-        ),
+        Resource("Deploying Unified Access Gateway", "https://techzone.omnissa.com/resource/deploying-unified-access-gateway", "UAG deployment guidance."),
+        Resource("Load Balancing UAG for Horizon", "https://techzone.omnissa.com/resource/load-balancing-unified-access-gateway-horizon", "Load balancing and scale design patterns."),
     ),
     follow_up_questions=(
-        Question(
-            "uag_nic_config",
-            "How many NICs should the UAG be deployed with?",
-            help_text="1 NIC: port 9443 (admin console) is exposed in the DMZ — brute-force risk, NOT recommended for production. "
-                      "2 NIC (recommended): DMZ NIC handles 443/8443 user traffic; Internal NIC connects to CS and VDI. "
-                      "3 NIC (most secure): DMZ NIC + Internal NIC + dedicated Management NIC on an internal-only network.",
-            options=(
-                "2 NIC — Recommended (DMZ NIC + Internal NIC)",
-                "3 NIC — Most secure (DMZ + Internal + Management NICs)",
-                "1 NIC — Not recommended for production",
-            ),
-        ),
-        Question(
-            "uag_services",
-            "Which services should Unified Access Gateway publish?",
-            help_text="Choose the edge service mix required for this customer.",
-            options=("Horizon edge", "Tunnel and web reverse proxy", "Content services edge", "Combined services"),
-        ),
-        Question(
-            "uag_edge_pattern",
-            "What edge deployment pattern should be used?",
-            help_text="Select the scale/HA pattern for UAG placement.",
-            options=("Single DMZ pair", "Per-site DMZ pair", "Global load-balanced edge"),
-        ),
-        Question(
-            "uag_arch_track",
-            "Which UAG architecture track should guide the design?",
-            help_text="Choose the UAG architecture/deployment baseline to shape the HLD.",
-            options=(
-                "UAG architecture baseline",
-                "UAG high-availability architecture",
-                "UAG load-balanced global edge architecture",
-            ),
-        ),
-        Question(
-            "uag_design_focus",
-            "Which UAG design section should be prioritized?",
-            help_text="Pick the edge topic that needs detailed design decisions.",
-            options=(
-                "DMZ placement and network segmentation",
-                "Protocol/service edge configuration",
-                "High availability and scale-out topology",
-                "Certificate, security hardening, and operations",
-            ),
-        ),
+        q("uag_nic_config", "How many NICs should the UAG be deployed with?", "2 NIC is common; 3 NIC separates management; 1 NIC is not recommended for production.", ("2 NIC - Recommended (DMZ NIC + Internal NIC)", "3 NIC - Most secure (DMZ + Internal + Management NICs)", "1 NIC - Not recommended for production", UNKNOWN)),
+        q("uag_services", "Which services should Unified Access Gateway publish?", "Choose the edge service mix required.", ("Horizon edge", "Tunnel and web reverse proxy", "Content services edge", "Combined services", UNKNOWN)),
+        q("uag_edge_pattern", "What edge deployment pattern should be used?", "Select the scale/HA pattern for UAG placement.", ("Single DMZ pair", "Per-site DMZ pair", "Global load-balanced edge", UNKNOWN)),
+        q("uag_arch_track", "Which UAG architecture track should guide the design?", "Choose the architecture/deployment baseline.", ("UAG architecture baseline", "UAG high-availability architecture", "UAG load-balanced global edge architecture", UNKNOWN)),
+        q("uag_design_focus", "Which UAG design section should be prioritized?", "Pick the edge topic that needs detailed decisions.", ("DMZ placement and network segmentation", "Protocol/service edge configuration", "High availability and scale-out topology", "Certificate, security hardening, and operations", UNKNOWN)),
     ),
 )
 
 
-PRODUCTS: dict[str, Product] = {
-    item.key: item
-    for item in (
-        HORIZON_8,
-        HORIZON_CLOUD,
-        APP_VOLUMES,
-        DEM,
-        WORKSPACE_ONE_UEM,
-        OMNISSA_ACCESS,
-        UAG,
-    )
-}
+PRODUCTS: dict[str, Product] = {item.key: item for item in (HORIZON_8, HORIZON_CLOUD, APP_VOLUMES, DEM, WORKSPACE_ONE_UEM, OMNISSA_ACCESS, UAG)}
 
 FAMILY_CHOICES: dict[str, tuple[str, ...]] = {
     "Horizon": ("horizon_8", "horizon_cloud", "app_volumes", "dynamic_environment_manager"),
@@ -687,9 +269,39 @@ FAMILY_CHOICES: dict[str, tuple[str, ...]] = {
 }
 
 
+def normalize_answer(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return ", ".join(str(item).strip() for item in value if str(item).strip())
+    return str(value).strip()
+
+
+def _answer(answers: dict, key: str) -> str:
+    return normalize_answer(answers.get(key)).lower()
+
+
+def _is_internal_only(answers: dict) -> bool:
+    return _answer(answers, "access_type") == "internal users only"
+
+
+def _is_external_access(answers: dict) -> bool:
+    access = _answer(answers, "access_type")
+    return access in {"external users only", "both internal and external"}
+
+
+def _is_single_site(answers: dict) -> bool:
+    return _answer(answers, "site_topology") == "single site"
+
+
+def _is_multi_site(answers: dict) -> bool:
+    site = _answer(answers, "site_topology")
+    availability = _answer(answers, "availability_requirements")
+    return site == "multi-site" or "multi-site" in availability or "active/passive" in availability or "active/active" in availability
+
+
 def required_questions(selected_product_keys: list[str]) -> list[Question]:
-    """Return the full ordered question list (including conditionally hidden ones)."""
-    questions: list[Question] = list(COMMON_QUESTIONS)
+    questions = list(COMMON_QUESTIONS)
     for key in selected_product_keys:
         product = PRODUCTS.get(key)
         if product:
@@ -697,23 +309,209 @@ def required_questions(selected_product_keys: list[str]) -> list[Question]:
     return questions
 
 
-def visible_questions(selected_product_keys: list[str], answers: dict) -> list[Question]:
-    """Return only questions that should be shown given the current answers.
+def _is_question_from_product(question: Question, product_key: str) -> bool:
+    product = PRODUCTS.get(product_key)
+    return bool(product and question in product.follow_up_questions)
 
-    A question with a non-empty ``show_if`` is included only when at least one
-    ``(answer_key, accepted_value)`` pair matches the current answers (OR logic).
-    """
-    result: list[Question] = []
-    for question in required_questions(selected_product_keys):
-        if question.show_if:
-            should_show = any(
-                normalize_answer(answers.get(k)) == v
-                for k, v in question.show_if
-            )
-            if not should_show:
-                continue
-        result.append(question)
-    return result
+
+def filtered_question_options(question: Question, selected_product_keys: list[str], answers: dict) -> tuple[str, ...]:
+    options = tuple(question.options)
+    if not options:
+        return options
+
+    hosting = _answer(answers, "hosting_strategy")
+    site = _answer(answers, "site_topology")
+    access = _answer(answers, "access_type")
+    load_balancer = _answer(answers, "load_balancer")
+    mfa_required = _answer(answers, "mfa_required")
+
+    def without(*needles: str) -> tuple[str, ...]:
+        return tuple(
+            opt for opt in options
+            if not any(needle.lower() in opt.lower() for needle in needles)
+        )
+
+    if question.key == "hosting_strategy":
+        if "horizon_cloud" in selected_product_keys and "horizon_8" not in selected_product_keys:
+            return ("Cloud", "Hybrid", UNKNOWN)
+        if selected_product_keys == ["unified_access_gateway"]:
+            return ("On-premises", "Hybrid", UNKNOWN)
+    if question.key == "in_scope" and access == "internal users only":
+        return without("external access")
+    if question.key == "success_criteria" and site == "single site":
+        return without("high availability")
+    if question.key == "network_segments" and access == "internal users only":
+        return without("dmz")
+    if question.key == "firewall_ports":
+        if access == "internal users only":
+            return without("external", "dmz")
+        if access == "external users only":
+            return tuple(opt for opt in options if "Internal firewall" not in opt)
+    if question.key == "dr_scenarios" and site == "single site":
+        return without("site failure")
+    if question.key == "open_items" and access == "internal users only":
+        return without("fqdn", "certificates", "load balancer vips")
+    if question.key == "access_type" and "unified_access_gateway" in selected_product_keys:
+        return ("External users only", "Both internal and external", UNKNOWN)
+    if question.key == "identity_source":
+        if hosting == "on-premises":
+            return tuple(opt for opt in options if opt != "Entra ID")
+        if hosting == "cloud":
+            return tuple(opt for opt in options if opt != "LDAP")
+    if question.key == "security_requirements" and mfa_required == "no":
+        return tuple(opt for opt in options if opt != "MFA + conditional access")
+    if question.key == "availability_requirements":
+        if site == "single site":
+            return ("N+1 within region", "Single site", UNKNOWN)
+        if site == "multi-site":
+            return ("Multi-site active/passive", "Multi-site active/active", UNKNOWN)
+    if question.key == "horizon_external_access" and access in {"external users only", "both internal and external"}:
+        return tuple(opt for opt in options if opt != "No external access")
+    if question.key == "horizon_access_topology":
+        scoped = options
+        if site == "single site":
+            scoped = tuple(opt for opt in scoped if "Global" not in opt)
+        if "no load balancer" in load_balancer:
+            scoped = tuple(opt for opt in scoped if "load balancer" not in opt.lower() or opt == "Without load balancer")
+        elif load_balancer.startswith("yes"):
+            scoped = tuple(opt for opt in scoped if opt != "Without load balancer")
+        return scoped
+    if question.key == "horizon_dmz_design":
+        scoped = tuple(opt for opt in options if opt != "No DMZ / internal only")
+        if site == "single site":
+            scoped = tuple(opt for opt in scoped if "Per-site" not in opt)
+        return scoped
+    if question.key == "horizon_pod_block_model":
+        if site == "single site":
+            return tuple(opt for opt in options if "Multi-site" not in opt and "Cloud Pod" not in opt)
+        if site == "multi-site":
+            return tuple(opt for opt in options if "Single-site" not in opt)
+    if question.key == "horizon_8_arch_track":
+        if hosting == "on-premises":
+            return ("Horizon 8 core architecture", UNKNOWN)
+        if hosting == "cloud":
+            return tuple(opt for opt in options if opt != "Horizon 8 core architecture")
+    if question.key == "horizon_8_design_focus" and access == "internal users only":
+        return tuple(opt for opt in options if "UAG" not in opt and "edge" not in opt.lower())
+    if question.key == "horizon_cloud_connectivity" and access == "internal users only":
+        return tuple(opt for opt in options if "UAG" not in opt)
+    if question.key == "access_catalog" and "horizon_8" not in selected_product_keys and "horizon_cloud" not in selected_product_keys:
+        return tuple(opt for opt in options if "virtual apps" not in opt and opt != "Unified catalog all apps")
+    if question.key == "access_arch_track" and access == "internal users only":
+        return tuple(opt for opt in options if "Zero Trust" not in opt)
+    if question.key == "uag_edge_pattern" and site == "single site":
+        return ("Single DMZ pair", UNKNOWN)
+    if question.key == "uag_arch_track" and site == "single site":
+        return tuple(opt for opt in options if "global" not in opt.lower() and "load-balanced" not in opt.lower())
+    if question.key == "uag_design_focus" and ("no load balancer" in load_balancer or site == "single site"):
+        return tuple(opt for opt in options if "scale-out" not in opt)
+    return options
+
+
+def should_show_question(question: Question, selected_product_keys: list[str], answers: dict) -> bool:
+    hosting = _answer(answers, "hosting_strategy")
+    access = _answer(answers, "access_type")
+    mfa_required = _answer(answers, "mfa_required")
+    site = _answer(answers, "site_topology")
+
+    if question.show_if and not any(normalize_answer(answers.get(k)) == v for k, v in question.show_if):
+        return False
+    if question.show_if_all and not all(normalize_answer(answers.get(k)) == v for k, v in question.show_if_all):
+        return False
+    if _is_question_from_product(question, "horizon_cloud") and hosting == "on-premises":
+        return False
+    if _is_question_from_product(question, "unified_access_gateway") and access == "internal users only":
+        return False
+    if question.key == "mfa_provider" and mfa_required == "no":
+        return False
+    if question.key in {"load_balancer", "fqdn_strategy", "cert_type", "certificate_owner"} and not _is_external_access(answers):
+        return False
+    if question.key in {"horizon_external_access", "horizon_access_topology", "horizon_dmz_design"} and not _is_external_access(answers):
+        return False
+    if question.key in {"uag_nic_config", "uag_services", "uag_edge_pattern", "uag_arch_track", "uag_design_focus"} and not _is_external_access(answers):
+        return False
+    if question.key == "secondary_sites" and not _is_multi_site(answers):
+        return False
+    if question.key in {"dr_scenarios"} and site == "single site" and _answer(answers, "availability_requirements") in {"single site", "n+1 within region"}:
+        return False
+    if question.key == "horizon_cloud_provider" and hosting == "on-premises":
+        return False
+
+    filtered_options = filtered_question_options(question, selected_product_keys, answers)
+    inferred_single_choice_questions = {"horizon_access_topology", "horizon_dmz_design", "uag_edge_pattern", "uag_arch_track"}
+    if question.key in inferred_single_choice_questions and len(filtered_options) == 1:
+        return False
+    return bool(filtered_options or not question.options)
+
+
+def visible_questions(selected_product_keys: list[str], answers: dict) -> list[Question]:
+    base = list(required_questions(selected_product_keys))
+    has_horizon_broker = any(k in selected_product_keys for k in ("horizon_8", "horizon_cloud"))
+    uag_not_selected = "unified_access_gateway" not in selected_product_keys
+    access = _answer(answers, "access_type")
+    if has_horizon_broker and uag_not_selected and ("external" in access or "both" in access):
+        existing_keys = {qst.key for qst in base}
+        for qst in UAG.follow_up_questions:
+            if qst.key == "uag_nic_config" and qst.key not in existing_keys:
+                base.append(qst)
+    return [question for question in base if should_show_question(question, selected_product_keys, answers)]
+
+
+QUESTION_SOURCE_HINTS: dict[str, Resource] = {
+    "business_drivers": Resource("Business Drivers, Use Cases and Service Definitions", "https://techzone.omnissa.com/resource/business-drivers-use-cases-and-service-definitions", "business drivers use cases service definitions requirements"),
+    "success_criteria": Resource("Workspace ONE and Horizon Reference Architecture", "https://techzone.omnissa.com/resource/workspace-one-and-horizon-reference-architecture-overview", "outcome validation success criteria requirements"),
+    "hosting_strategy": Resource("Workspace ONE and Horizon Reference Architecture", "https://techzone.omnissa.com/resource/workspace-one-and-horizon-reference-architecture-overview", "deployment model hosting on-premises cloud hybrid architecture"),
+    "site_topology": Resource("Horizon 8 Architecture", "https://techzone.omnissa.com/resource/horizon-8-architecture", "single-site multi-site pods availability"),
+    "access_type": Resource("Understand and Troubleshoot Horizon Connections", "https://techzone.omnissa.com/resource/understand-and-troubleshoot-horizon-connections", "internal external client connection flow"),
+    "load_balancer": Resource("Horizon 8 Architecture", "https://techzone.omnissa.com/resource/horizon-8-architecture", "load balanced connection servers horizon clients"),
+    "fqdn_strategy": Resource("Unified Access Gateway Architecture", "https://techzone.omnissa.com/resource/unified-access-gateway-architecture", "fqdn dns split dns external internal url"),
+    "cert_type": Resource("Unified Access Gateway Architecture", "https://techzone.omnissa.com/resource/unified-access-gateway-architecture", "ssl tls certificate private key"),
+    "identity_source": Resource("Horizon 8 Architecture", "https://techzone.omnissa.com/resource/horizon-8-architecture", "active directory identity authentication"),
+    "firewall_ports": Resource("Network Ports in Horizon 8", "https://techzone.omnissa.com/resource/network-ports-horizon-8", "network ports firewall blast pcoip"),
+    "security_requirements": Resource("Workspace ONE and Horizon Reference Architecture", "https://techzone.omnissa.com/resource/workspace-one-and-horizon-reference-architecture-overview", "security controls compliance mfa"),
+    "mfa_required": Resource("Horizon 8 Architecture", "https://techzone.omnissa.com/resource/horizon-8-architecture", "multi-factor authentication saml radius"),
+    "availability_requirements": Resource("Horizon 8 Architecture", "https://techzone.omnissa.com/resource/horizon-8-architecture", "availability n+1 multi-site active passive active active"),
+    "backup_requirements": Resource("Horizon 8 Configuration", "https://techzone.omnissa.com/resource/horizon-8-configuration", "backup recovery configuration golden image"),
+    "horizon_use_cases": Resource("Business Drivers, Use Cases and Service Definitions", "https://techzone.omnissa.com/resource/business-drivers-use-cases-and-service-definitions", "horizon service definitions pooled persistent rdsh apps"),
+    "horizon_pool_model": Resource("Horizon 8 Configuration", "https://techzone.omnissa.com/resource/horizon-8-configuration", "desktop pools farms instant clone rdsh"),
+    "horizon_pod_block_model": Resource("Horizon 8 Architecture", "https://techzone.omnissa.com/resource/horizon-8-architecture", "pod block cloud pod architecture"),
+    "horizon_connection_server_count": Resource("Reference Architecture VM Specifications", "https://techzone.omnissa.com/resource/reference-architecture-vm-specifications", "connection server vm specifications sizing"),
+    "horizon_external_access": Resource("Unified Access Gateway Architecture", "https://techzone.omnissa.com/resource/unified-access-gateway-architecture", "external access horizon uag dmz"),
+    "horizon_access_topology": Resource("Unified Access Gateway Architecture", "https://techzone.omnissa.com/resource/unified-access-gateway-architecture", "load balanced edge topology"),
+    "horizon_dmz_design": Resource("Unified Access Gateway Architecture", "https://techzone.omnissa.com/resource/unified-access-gateway-architecture", "single dmz double dmz network segmentation"),
+    "horizon_protocol_scope": Resource("Network Ports in Horizon 8", "https://techzone.omnissa.com/resource/network-ports-horizon-8", "blast pcoip rdp protocol ports"),
+    "horizon_8_arch_track": Resource("Horizon 8 Architecture", "https://techzone.omnissa.com/resource/horizon-8-architecture", "core cloud platform architecture"),
+    "horizon_8_design_focus": Resource("Horizon 8 Architecture", "https://techzone.omnissa.com/resource/horizon-8-architecture", "component design workloads network availability"),
+    "horizon_database_events": Resource("Horizon 8 Configuration", "https://techzone.omnissa.com/resource/horizon-8-configuration", "events database sql monitoring"),
+    "horizon_golden_image": Resource("Horizon 8 Configuration", "https://techzone.omnissa.com/resource/horizon-8-configuration", "golden image parent vm optimization"),
+    "app_volumes_arch_track": Resource("App Volumes Architecture", "https://techzone.omnissa.com/resource/app-volumes-architecture", "app volumes architecture"),
+    "app_volumes_storage": Resource("App Volumes Architecture", "https://techzone.omnissa.com/resource/app-volumes-architecture", "storage groups datastore packages"),
+    "app_volumes_database": Resource("App Volumes Architecture", "https://techzone.omnissa.com/resource/app-volumes-architecture", "database sql availability"),
+    "dem_arch_track": Resource("Dynamic Environment Manager Architecture", "https://techzone.omnissa.com/resource/dynamic-environment-manager-architecture", "dem architecture"),
+    "dem_file_shares": Resource("Dynamic Environment Manager Architecture", "https://techzone.omnissa.com/resource/dynamic-environment-manager-architecture", "configuration share profile archive smb"),
+    "dem_profile_strategy": Resource("Dynamic Environment Manager Architecture", "https://techzone.omnissa.com/resource/dynamic-environment-manager-architecture", "profile strategy fslogix"),
+    "uag_nic_config": Resource("Deploying Unified Access Gateway", "https://techzone.omnissa.com/resource/deploying-unified-access-gateway", "uag nic configuration"),
+    "uag_arch_track": Resource("Unified Access Gateway Architecture", "https://techzone.omnissa.com/resource/unified-access-gateway-architecture", "uag high availability load balanced edge"),
+}
+
+
+def question_source(question: Question, selected_product_keys: list[str]) -> Resource | None:
+    hint = QUESTION_SOURCE_HINTS.get(question.key)
+    if hint:
+        return hint
+    if question.source_url and is_allowed_techzone_url(question.source_url):
+        return Resource(
+            title=question.source_title or "Tech Zone source",
+            url=question.source_url,
+            summary=question.source_query or question.source_section_title or "Question source",
+        )
+    return None
+
+
+def effective_answers(answers: dict[str, str]) -> dict[str, str]:
+    resolved = dict(answers)
+    resolved.setdefault("horizon_protocol_scope", "Blast Extreme only")
+    return resolved
 
 
 def compile_reference_resources(selected_product_keys: list[str]) -> list[Resource]:
@@ -730,11 +528,3 @@ def compile_reference_resources(selected_product_keys: list[str]) -> list[Resour
                 resources.append(resource)
                 seen.add(resource.url)
     return resources
-
-
-def normalize_answer(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, list):
-        return ", ".join(str(item).strip() for item in value if str(item).strip())
-    return str(value).strip()

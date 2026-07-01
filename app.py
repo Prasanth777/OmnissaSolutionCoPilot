@@ -9,7 +9,6 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import chromadb
 import streamlit as st
 
 ROOT = Path(__file__).resolve().parent
@@ -17,13 +16,12 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from sa_hld_bot.agents import AgenticRagOrchestrator, GuardrailAgent, RetrievalAgent, SolutionAgent
-from sa_hld_bot.azure_foundry import AzureFoundryClient
-from sa_hld_bot.catalog import FAMILY_CHOICES, PRODUCTS, compile_reference_resources, normalize_answer, required_questions, visible_questions
+# Lightweight imports only — keep the initial page render fast.
+# Heavy modules (chromadb, rag, agents) are imported lazily inside initialize_agents().
+from sa_hld_bot.catalog import FAMILY_CHOICES, PRODUCTS, Question, compile_reference_resources, effective_answers, filtered_question_options, normalize_answer, question_source, visible_questions
 from sa_hld_bot.config import load_settings
-from sa_hld_bot.docx_builder import HldDocxBuilder
-from sa_hld_bot.ppt_builder import HldPptBuilder
-from sa_hld_bot.rag import TechZoneRagStore
+from sa_hld_bot.image_followup import apply_command, looks_like_image_command, parse_command
+from sa_hld_bot.sessions import delete_session, list_sessions, load_session, save_session
 
 
 st.set_page_config(
@@ -49,6 +47,8 @@ def bootstrap_state() -> None:
     st.session_state.setdefault("ppt_preview", [])
     st.session_state.setdefault("ppt_preview_images", [])
     st.session_state.setdefault("last_references", [])
+    st.session_state.setdefault("rag_narrative", {})
+    st.session_state.setdefault("current_session_id", "")
     st.session_state.setdefault("use_sample_template", True)
     st.session_state.setdefault("sample_template_path", "/Users/prasanththangaraj/Downloads/test-for AI.pptx")
 
@@ -70,6 +70,20 @@ def pending_questions():
         if not normalize_answer(st.session_state.answers.get(question.key)):
             missing.append(question)
     return missing
+
+
+def prune_hidden_answers() -> None:
+    visible_keys = {question.key for question in visible_questions(st.session_state.selected_products, st.session_state.answers)}
+    stale_keys = [key for key in st.session_state.answers if key not in visible_keys]
+    for key in stale_keys:
+        st.session_state.answers.pop(key, None)
+
+
+def question_source_markdown(question: Question) -> str:
+    source_hint = question_source(question, st.session_state.selected_products)
+    if not source_hint:
+        return ""
+    return f"[Source: {source_hint.title}]({source_hint.url})"
 
 
 def ask_next_question_if_needed() -> None:
@@ -151,9 +165,14 @@ def _initialize_agents_cached(
     max_images_per_page: int,
     sitemap_resource_only: bool,
 ):
-    from sa_hld_bot.config import Settings
+    # Heavy imports done here so module-level startup is fast.
+    import chromadb  # noqa: F401 (side-effect: initialises chroma logging)
+    from sa_hld_bot.agents import AgenticRagOrchestrator, GuardrailAgent, RetrievalAgent, SolutionAgent
+    from sa_hld_bot.azure_foundry import AzureFoundryClient
+    from sa_hld_bot.rag import TechZoneRagStore
+    from sa_hld_bot.config import Settings as _Settings
 
-    settings = Settings(
+    settings = _Settings(
         azure_openai_endpoint=endpoint,
         azure_openai_api_key=api_key,
         azure_openai_api_version=api_version,
@@ -182,6 +201,7 @@ def _initialize_agents_cached(
 
 def verify_ingestion_coverage(settings) -> dict[str, object]:
     from sa_hld_bot.rag import TechZoneCrawler
+    import chromadb
 
     crawler = TechZoneCrawler(settings)
     sitemap_urls = crawler.sitemap_urls()
@@ -232,6 +252,7 @@ def sync_selection_state() -> None:
         st.session_state.active_question_key = ""
         st.session_state.generated_signature = ""
         st.session_state.last_references = []
+        st.session_state.current_session_id = ""
 
 
 def answer_question(value: str) -> None:
@@ -242,6 +263,7 @@ def answer_question(value: str) -> None:
     if not normalized:
         return
     st.session_state.answers[question.key] = normalized
+    prune_hidden_answers()
     st.session_state.generated_signature = ""
     chat_add("user", normalized)
     st.session_state.active_question_key = ""
@@ -365,21 +387,72 @@ def derive_solution_references(product_keys: list[str], answers: dict[str, str])
     return refs
 
 
-def generate_hld_outputs(orchestrator: AgenticRagOrchestrator, rag: TechZoneRagStore) -> tuple[Path, Path, list[str], list[dict[str, str]]]:
-    answers = st.session_state.answers
+def filter_solution_references(product_keys: list[str], answers: dict[str, str], refs: list[str]) -> list[str]:
+    if "horizon_8" not in product_keys:
+        return refs
+
+    hosting = answers.get("hosting_strategy", "").lower()
+    access_type = answers.get("access_type", "").lower()
+    track = answers.get("horizon_8_arch_track", "").lower()
+
+    cloud_ref_tokens = {
+        "vmware cloud on aws": "horizon-8-vmware-cloud-aws-architecture",
+        "azure vmware solution": "horizon-8-azure-vmware-solution-architecture",
+        "google cloud vmware engine": "horizon-8-google-cloud-vmware-engine-architecture",
+        "oracle cloud vmware solution": "horizon-8-oracle-cloud-vmware-solution-architecture",
+        "alibaba cloud vmware service": "horizon-8-alibaba-cloud-vmware-service-architecture",
+    }
+    selected_cloud_token = ""
+    for answer_token, url_token in cloud_ref_tokens.items():
+        if answer_token in track:
+            selected_cloud_token = url_token
+            break
+
+    filtered: list[str] = []
+    for url in refs:
+        lower_url = url.lower()
+        is_h8_cloud_ref = any(token in lower_url for token in cloud_ref_tokens.values())
+        if hosting == "on-premises" and is_h8_cloud_ref:
+            continue
+        if selected_cloud_token and is_h8_cloud_ref and selected_cloud_token not in lower_url:
+            continue
+        if access_type == "internal users only" and "unified-access-gateway" in lower_url:
+            continue
+        filtered.append(url)
+    return list(dict.fromkeys(filtered))
+
+
+def image_source_references(image_rows: list[dict]) -> list[str]:
+    refs: list[str] = []
+    for row in image_rows or []:
+        page_url = str(row.get("page_url") or "").strip()
+        if page_url:
+            refs.append(page_url)
+    return list(dict.fromkeys(refs))
+
+
+def generate_hld_outputs(orchestrator, rag_store):
+    from sa_hld_bot.ppt_builder import HldPptBuilder
+    from sa_hld_bot.docx_builder import HldDocxBuilder
+    answers = effective_answers(st.session_state.answers)
     product_keys = st.session_state.selected_products
     product_objs = [PRODUCTS[key] for key in product_keys if key in PRODUCTS]
     resources = compile_reference_resources(product_keys)
 
     context_blob = "\n".join(f"{k}: {v}" for k, v in answers.items())
+    hld_instruction = (
+        "Use Omnissa Tech Zone context from the RAG results only. Write for a formal high-level design document. "
+        "Ground each recommendation in the retrieved architecture guidance. If a customer detail is unknown or to be confirmed, "
+        "state it as an assumption or open item rather than inventing a value."
+    )
     prompts = {
-        "summary": f"Create a customer-facing executive summary based on these inputs:\n{context_blob}",
-        "architecture": f"Provide a high-level architecture description for selected products {', '.join(product_keys)} and customer inputs:\n{context_blob}",
-        "security": f"Describe security and access design for these customer constraints:\n{context_blob}",
-        "operations": f"Describe operational model, HA, and DR for these customer constraints:\n{context_blob}",
+        "summary": f"{hld_instruction}\nCreate a customer-facing executive summary based on these inputs:\n{context_blob}",
+        "architecture": f"{hld_instruction}\nProvide a high-level architecture description for selected products {', '.join(product_keys)} and customer inputs:\n{context_blob}",
+        "security": f"{hld_instruction}\nDescribe security standards, access design, RBAC, certificates, hardening, and logging for these customer constraints:\n{context_blob}",
+        "operations": f"{hld_instruction}\nDescribe operational model, HA, backup, monitoring, and DR for these customer constraints:\n{context_blob}",
     }
     for key in product_keys:
-        prompts[key] = f"Provide customer-facing HLD design guidance for {PRODUCTS[key].title} using these inputs:\n{context_blob}"
+        prompts[key] = f"{hld_instruction}\nProvide customer-facing HLD detailed design guidance for {PRODUCTS[key].title} using these inputs:\n{context_blob}"
 
     narrative: dict[str, str] = {}
     all_citations: list[str] = []
@@ -394,12 +467,19 @@ def generate_hld_outputs(orchestrator: AgenticRagOrchestrator, rag: TechZoneRagS
     citation_refs = [resources_url for resources_url in all_citations if resources_url]
     derived_refs = derive_solution_references(product_keys, answers)
     base_refs = [resource.url for resource in resources]
-    references = list(dict.fromkeys(base_refs + derived_refs + citation_refs))
-    image_rows = rag.select_hld_images(
+    candidate_references = filter_solution_references(product_keys, answers, list(dict.fromkeys(base_refs + derived_refs + citation_refs)))
+    from sa_hld_bot.image_select import select_hld_images as select_hld_images_v3
+    image_rows = select_hld_images_v3(
+        rag_store,
         selected_products=product_keys,
         answers=answers,
-        reference_urls=references,
+        reference_urls=candidate_references,
         limit=10,
+    )
+    references = filter_solution_references(
+        product_keys,
+        answers,
+        list(dict.fromkeys(citation_refs + image_source_references(image_rows))),
     )
 
     output_dir = ROOT / "output"
@@ -450,18 +530,148 @@ def generate_hld_outputs(orchestrator: AgenticRagOrchestrator, rag: TechZoneRagS
     st.session_state.last_references = references
     st.session_state.ppt_path = str(output_path)
     st.session_state.docx_path = str(docx_path)
+    st.session_state.rag_narrative = narrative
+    persist_current_session()
     return output_path, docx_path, references, preview_sections
+
+
+def _session_title() -> str:
+    customer = st.session_state.answers.get("customer_name", "Customer") or "Customer"
+    names = ", ".join(PRODUCTS[k].title for k in st.session_state.selected_products if k in PRODUCTS)
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    return f"{customer} - {names or 'No products'} - {stamp}"
+
+
+def persist_current_session() -> str:
+    payload = {
+        "id": st.session_state.get("current_session_id") or None,
+        "title": _session_title(),
+        "selected_families": list(st.session_state.selected_families),
+        "selected_products": list(st.session_state.selected_products),
+        "answers": dict(st.session_state.answers),
+        "references": list(st.session_state.get("last_references", [])),
+        "preview_sections": st.session_state.get("ppt_preview", []),
+        "image_rows": st.session_state.get("ppt_preview_images", []),
+        "rag_narrative": st.session_state.get("rag_narrative", {}),
+        "messages": st.session_state.get("messages", []),
+        "ppt_path": st.session_state.get("ppt_path", ""),
+        "docx_path": st.session_state.get("docx_path", ""),
+    }
+    sid = save_session(ROOT / "data", payload, session_id=payload["id"])
+    st.session_state.current_session_id = sid
+    return sid
+
+
+def load_session_into_state(payload: dict) -> None:
+    products = list(payload.get("selected_products", []))
+    families = sorted({PRODUCTS[k].family for k in products if k in PRODUCTS})
+    st.session_state.selected_products = products
+    st.session_state.selected_families = families
+    st.session_state.answers = dict(payload.get("answers", {}))
+    st.session_state.ppt_preview = payload.get("preview_sections", [])
+    st.session_state.ppt_preview_images = payload.get("image_rows", [])
+    st.session_state.last_references = payload.get("references", [])
+    st.session_state.rag_narrative = payload.get("rag_narrative", {})
+    st.session_state.ppt_path = payload.get("ppt_path", "")
+    st.session_state.docx_path = payload.get("docx_path", "")
+    st.session_state.messages = payload.get("messages", []) or []
+    st.session_state.active_question_key = ""
+    st.session_state.current_session_id = payload.get("id", "")
+    st.session_state.generated_signature = _generation_signature()
+
+
+def rebuild_deck_from_state() -> None:
+    from sa_hld_bot.ppt_builder import HldPptBuilder
+    from sa_hld_bot.docx_builder import HldDocxBuilder
+    """Rebuild PPT/DOCX from stored narrative + current image set (no LLM calls)."""
+    narrative = st.session_state.get("rag_narrative") or {}
+    if not narrative:
+        return
+    product_keys = st.session_state.selected_products
+    product_objs = [PRODUCTS[k] for k in product_keys if k in PRODUCTS]
+    answers = effective_answers(st.session_state.answers)
+    references = st.session_state.get("last_references", [])
+    image_rows = st.session_state.get("ppt_preview_images", [])
+    output_dir = ROOT / "output"
+    base_name = f"{answers.get('customer_name', 'Customer').replace(' ', '_')}_HLD_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    output_path = output_dir / f"{base_name}.pptx"
+    docx_path = output_dir / f"{base_name}.docx"
+    builder = HldPptBuilder()
+    sample_path_raw = str(st.session_state.get("sample_template_path", "")).strip()
+    build_kwargs = dict(
+        output_path=output_path, customer_name=answers.get("customer_name", "Customer"),
+        selected_products=product_objs, questionnaire=answers, rag_narrative=narrative,
+        references=references, image_rows=image_rows,
+    )
+    params = inspect.signature(builder.build).parameters
+    if "sample_ppt_path" in params:
+        build_kwargs["sample_ppt_path"] = Path(sample_path_raw) if sample_path_raw else None
+    if "use_sample_style" in params:
+        build_kwargs["use_sample_style"] = bool(st.session_state.get("use_sample_template", False))
+    builder.build(**build_kwargs)
+    HldDocxBuilder().build(
+        output_path=docx_path, customer_name=answers.get("customer_name", "Customer"),
+        selected_products=product_objs, questionnaire=answers, rag_narrative=narrative,
+        references=references, image_rows=image_rows,
+    )
+    st.session_state.ppt_path = str(output_path)
+    st.session_state.docx_path = str(docx_path)
+    persist_current_session()
 
 
 bootstrap_state()
 sync_selection_state()
-settings, rag_store, orchestrator = initialize_agents()
+
+settings = load_settings(ROOT)
+rag_store = None
+orchestrator = None
+
+
+def get_agents():
+    """Initialize heavy AI/RAG dependencies only when a workflow needs them."""
+    with st.spinner("Loading AI agents and vector store..."):
+        return initialize_agents()
+
 ensure_seed_message()
 
 st.title("Solution Architect CoPilot")
 st.caption("Azure AI Foundry + Tech Zone only RAG + customer-ready PowerPoint generation.")
 
 with st.sidebar:
+    st.subheader("Saved Sessions")
+    if st.button("➕ New session", key="new_session_btn"):
+        st.session_state.current_session_id = ""
+        st.session_state.selected_families = []
+        st.session_state.selected_products = []
+        st.session_state.answers = {}
+        st.session_state.messages = st.session_state.messages[:1]
+        st.session_state.active_question_key = ""
+        st.session_state.generated_signature = ""
+        st.session_state.ppt_preview = []
+        st.session_state.ppt_preview_images = []
+        st.session_state.last_references = []
+        st.session_state.rag_narrative = {}
+        st.session_state.ppt_path = ""
+        st.session_state.docx_path = ""
+        st.rerun()
+    _saved = list_sessions(ROOT / "data")
+    if not _saved:
+        st.caption("No saved sessions yet. Generate an HLD to save one.")
+    for _s in _saved[:25]:
+        _row = st.columns([5, 1])
+        active = _s["id"] == st.session_state.get("current_session_id")
+        label = ("● " if active else "") + _s.get("title", _s["id"])
+        if _row[0].button(label, key=f"load_{_s['id']}", help="Open this session"):
+            _payload = load_session(ROOT / "data", _s["id"])
+            if _payload:
+                load_session_into_state(_payload)
+                st.rerun()
+        if _row[1].button("🗑", key=f"del_{_s['id']}", help="Delete"):
+            delete_session(ROOT / "data", _s["id"])
+            if active:
+                st.session_state.current_session_id = ""
+            st.rerun()
+
     st.subheader("System")
     if settings.configured:
         st.success("Azure AI Foundry configuration detected")
@@ -474,18 +684,17 @@ with st.sidebar:
     st.subheader("RAG Control")
     page_limit = st.number_input("Max sitemap pages to index", min_value=50, max_value=5000, value=100, step=50)
     force_full_rebuild = st.checkbox("Force full rebuild (ignore delta)", value=False)
-    if rag_store:
-        live = rag_store.index_stats()
-        st.caption(f"Current index: {live['chunks']} chunks, {live['images']} images")
-        st.session_state.rag_stats = live
+    live = st.session_state.get("rag_stats", {"chunks": 0, "images": 0})
+    st.caption(f"Last known index: {live.get('chunks', 0)} chunks, {live.get('images', 0)} images")
     rebuild = st.button("Build / Rebuild Tech Zone RAG")
     if rebuild:
-        if not settings.configured or not rag_store:
+        _settings, _rag_store, _orchestrator = get_agents()
+        if not _settings.configured or not _rag_store:
             st.error("Azure configuration missing. Cannot build RAG.")
         else:
             try:
                 with st.spinner("Crawling Tech Zone sitemap and building Chroma index..."):
-                    stats = rag_store.rebuild_from_sitemap(
+                    stats = _rag_store.rebuild_from_sitemap(
                         max_pages=int(page_limit),
                         force_full_rebuild=bool(force_full_rebuild),
                     )
@@ -504,11 +713,12 @@ with st.sidebar:
 
     verify = st.button("Verify Ingestion Coverage")
     if verify:
-        if not rag_store:
+        _settings, _rag_store, _orchestrator = get_agents()
+        if not _rag_store:
             st.error("RAG store is not initialized.")
         else:
             with st.spinner("Checking sitemap resources vs indexed pages..."):
-                report = verify_ingestion_coverage(settings)
+                report = verify_ingestion_coverage(_settings)
             st.info(
                 f"Sitemap resources: {report['sitemap_resources']} | Indexed unique pages: {report['indexed_unique_pages']} | "
                 f"Chunks: {report['chunks']} | Missing: {report['missing_count']}"
@@ -570,14 +780,14 @@ with st.container(border=True):
             placeholder="Choose one or more families",
         )
         if families != st.session_state.selected_families:
-            st.session_state.selected_families = families
+            st.session_state.selected_families = list(families)
             set_products_from_families(families)
             st.session_state.answers = {}
             st.session_state.messages = st.session_state.messages[:1]
             st.session_state.active_question_key = ""
             st.session_state.generated_signature = ""
             st.session_state.last_references = []
-            st.rerun()
+            st.session_state.current_session_id = ""
 
     with top_right:
         st.markdown("**Progress**")
@@ -594,6 +804,8 @@ with st.container(border=True):
     available = []
     for fam in st.session_state.selected_families:
         available.extend(FAMILY_CHOICES.get(fam, ()))
+    ADDON_PRODUCTS = {"app_volumes", "dynamic_environment_manager"}
+    HORIZON_BROKERS = {"horizon_8", "horizon_cloud"}
     if available:
         product_cols = st.columns(2)
         new_selected_products: list[str] = []
@@ -603,6 +815,16 @@ with st.container(border=True):
                 toggle = st.checkbox(PRODUCTS[key].title, value=selected, key=f"product_{key}")
                 if toggle:
                     new_selected_products.append(key)
+        # Enforce broker dependency: App Volumes and DEM require Horizon 8 or Horizon Cloud.
+        has_broker = any(k in new_selected_products for k in HORIZON_BROKERS)
+        addons_checked = [k for k in new_selected_products if k in ADDON_PRODUCTS]
+        if addons_checked and not has_broker:
+            new_selected_products = [k for k in new_selected_products if k not in ADDON_PRODUCTS]
+            st.warning(
+                f"{', '.join(PRODUCTS[k].title for k in addons_checked)} "
+                "requires Horizon 8 or Horizon Cloud as a broker. "
+                "Please select a Horizon product first."
+            )
         if new_selected_products != st.session_state.selected_products:
             st.session_state.selected_products = new_selected_products
             st.session_state.answers = {}
@@ -610,7 +832,7 @@ with st.container(border=True):
             st.session_state.active_question_key = ""
             st.session_state.generated_signature = ""
             st.session_state.last_references = []
-            st.rerun()
+            st.session_state.current_session_id = ""
     else:
         st.info("Select at least one family to reveal the available product tracks.")
 
@@ -627,16 +849,22 @@ if st.session_state.selected_products:
 
     next_q = first_question()
     if next_q:
-        if next_q.options:
+        source = question_source_markdown(next_q)
+        if source:
+            st.caption(source)
+        options = filtered_question_options(next_q, st.session_state.selected_products, st.session_state.answers)
+        if options:
             st.markdown("**Suggested answers**")
-            chosen = None
-            if hasattr(st, "pills"):
-                chosen = st.pills("Click a suggestion", options=list(next_q.options), key=f"pill_{next_q.key}")
-            else:
-                chosen = st.radio("Click a suggestion", options=list(next_q.options), key=f"radio_{next_q.key}", horizontal=True)
-            if chosen:
-                answer_question(chosen)
-                st.rerun()
+            cols = st.columns(min(3, max(1, len(options))))
+            for idx, option in enumerate(options):
+                with cols[idx % len(cols)]:
+                    st.button(
+                        option,
+                        key=f"answer_{next_q.key}_{idx}",
+                        on_click=answer_question,
+                        args=(option,),
+                        use_container_width=True,
+                    )
 
         custom = st.chat_input("Answer input")
         focus_chat_input()
@@ -648,42 +876,46 @@ if st.session_state.selected_products:
         est_seconds = estimate_ppt_generation_seconds()
         st.info(f"Estimated PPT generation time: ~{est_seconds // 60}m {est_seconds % 60}s")
         generation_sig = _generation_signature()
-        current_chunks = int(st.session_state.rag_stats.get("chunks", 0))
-        if generation_sig != st.session_state.generated_signature and orchestrator and rag_store and current_chunks > 0:
-            with st.spinner(f"Generating customer-facing HLD PowerPoint (estimated ~{est_seconds // 60}m {est_seconds % 60}s)..."):
-                output_path, docx_path, refs, _preview = generate_hld_outputs(orchestrator, rag_store)
-            st.session_state.generated_signature = generation_sig
-            refs_short = "\n".join(f"- {url}" for url in refs[:6])
-            chat_add(
-                "assistant",
-                f"HLD outputs generated: `{output_path}` and `{docx_path}`\n\nTop references used:\n{refs_short}",
-            )
-            st.rerun()
 
-        st.caption("You can ask follow-up design questions or regenerate the deck.")
-        user_q = st.chat_input("Ask a solution question from Tech Zone RAG", key="post_question")
+        st.caption("You can ask follow-up design questions or edit the diagrams.")
+        user_q = st.chat_input(
+            "Ask about the architecture, or edit diagrams (e.g. 'remove the DMZ image', "
+            "'add a True SSO diagram', 'use double DMZ', 'regenerate')",
+            key="post_question",
+        )
         focus_chat_input()
         if user_q:
             chat_add("user", user_q)
-            if not orchestrator:
-                chat_add("assistant", "Azure AI Foundry is not configured.")
-            elif not rag_store:
-                chat_add("assistant", "RAG store is not initialized.")
+            _settings, _rag_store, _orchestrator = get_agents()
+            if not _orchestrator or not _rag_store:
+                chat_add("assistant", "Azure AI Foundry and RAG store are required.")
             else:
-                result = orchestrator.answer(user_q)
-                if result.blocked:
-                    chat_add("assistant", f"Blocked by guardrail: {result.blocked_reason}")
+                cmd = parse_command(_rag_store.foundry, user_q) if looks_like_image_command(user_q) else {"action": "none"}
+                if cmd.get("action", "none") != "none":
+                    new_rows, msg = apply_command(
+                        _rag_store, cmd, effective_answers(st.session_state.answers),
+                        st.session_state.selected_products, st.session_state.last_references,
+                        st.session_state.ppt_preview_images, limit=10,
+                    )
+                    st.session_state.ppt_preview_images = new_rows
+                    rebuild_deck_from_state()
+                    chat_add("assistant", msg or "Updated the diagrams.")
                 else:
-                    refs = "\n".join(f"- {src}" for src in result.citations[:8])
-                    chat_add("assistant", f"{result.answer}\n\nSources:\n{refs}")
+                    result = _orchestrator.answer(user_q)
+                    if result.blocked:
+                        chat_add("assistant", f"Blocked by guardrail: {result.blocked_reason}")
+                    else:
+                        refs = "\n".join(f"- {src}" for src in result.citations[:8])
+                        chat_add("assistant", f"{result.answer}\n\nSources:\n{refs}")
             st.rerun()
 
         if st.button("Generate Customer HLD PPT", type="primary"):
-            if not orchestrator or not rag_store:
+            _settings, _rag_store, _orchestrator = get_agents()
+            if not _orchestrator or not _rag_store:
                 st.error("Azure AI Foundry and RAG store are required.")
             else:
                 with st.spinner(f"Generating RAG-grounded customer PowerPoint (estimated ~{est_seconds // 60}m {est_seconds % 60}s)..."):
-                    output_path, docx_path, refs, _preview = generate_hld_outputs(orchestrator, rag_store)
+                    output_path, docx_path, refs, _preview = generate_hld_outputs(_orchestrator, _rag_store)
                 st.session_state.generated_signature = generation_sig
                 refs_short = "\n".join(f"- {url}" for url in refs[:6])
                 chat_add(

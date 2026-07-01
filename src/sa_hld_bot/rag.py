@@ -7,7 +7,7 @@ import subprocess
 import time
 import hashlib
 from datetime import datetime, timezone
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 from xml.etree import ElementTree
@@ -18,10 +18,19 @@ from bs4 import BeautifulSoup
 from PIL import Image
 
 from .azure_foundry import AzureFoundryClient, RetrievedChunk
-from .catalog import TECHZONE_DOMAIN, TECHZONE_SITEMAP_URL
+from .catalog import Resource, TECHZONE_DOMAIN, TECHZONE_SITEMAP_URL
 from .config import Settings
 from .embeddings import HuggingFaceEmbeddingService
 from .guardrails import is_techzone_source
+from .image_context import extract_image_records
+from .image_pipeline import (
+    KEEP_TYPES,
+    build_v3_caption_row,
+    classify_image,
+    classify_image_type,
+    load_classification_cache,
+    load_enriched_cache,
+)
 from .logging_utils import get_logger
 
 
@@ -60,7 +69,7 @@ ARCHITECTURE_HINTS = (
     "deployment",
     "design",
 )
-CAPTION_SCHEMA_VERSION = 2
+CAPTION_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -69,6 +78,15 @@ class CrawlPage:
     title: str
     text: str
     image_urls: list[str]
+    sections: list["CrawlSection"]
+    image_records: list[dict] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class CrawlSection:
+    title: str
+    url: str
+    text: str
 
 
 def _normalize_whitespace(text: str) -> str:
@@ -82,6 +100,55 @@ def _extract_text(soup: BeautifulSoup) -> str:
         if len(text) >= 25:
             candidates.append(text)
     return "\n".join(candidates)
+
+
+def _nearest_heading_id(node) -> str:
+    raw_id = str(node.get("id") or "").strip()
+    if raw_id:
+        return raw_id
+    parent = node.find_parent(id=True)
+    if parent:
+        return str(parent.get("id") or "").strip()
+    anchor = node.find("a", attrs={"id": True})
+    if anchor:
+        return str(anchor.get("id") or "").strip()
+    named_anchor = node.find("a", attrs={"name": True})
+    if named_anchor:
+        return str(named_anchor.get("name") or "").strip()
+    return ""
+
+
+def _extract_sections(soup: BeautifulSoup, page_url: str, page_title: str) -> list[CrawlSection]:
+    sections: list[CrawlSection] = []
+    current_title = page_title
+    current_url = page_url
+    current_parts: list[str] = []
+
+    def flush() -> None:
+        nonlocal current_parts
+        text = "\n".join(part for part in current_parts if part).strip()
+        if text:
+            sections.append(CrawlSection(title=current_title, url=current_url, text=text))
+        current_parts = []
+
+    for node in soup.find_all(["h1", "h2", "h3", "h4", "p", "li"]):
+        text = _normalize_whitespace(node.get_text(" ", strip=True))
+        if not text:
+            continue
+        if node.name in {"h1", "h2", "h3", "h4"}:
+            flush()
+            current_title = text
+            heading_id = _nearest_heading_id(node)
+            current_url = f"{page_url}#{heading_id}" if heading_id else page_url
+            continue
+        if len(text) >= 25:
+            current_parts.append(text)
+    flush()
+
+    if sections:
+        return sections
+    fallback = _extract_text(soup)
+    return [CrawlSection(title=page_title, url=page_url, text=fallback)] if fallback else []
 
 
 def _chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
@@ -328,13 +395,21 @@ class TechZoneCrawler:
 
         title = _normalize_whitespace(soup.title.get_text(strip=True) if soup.title else url)
         text = _extract_text(soup)
+        sections = _extract_sections(soup, url, title)
         image_urls: list[str] = []
         for image in soup.find_all("img"):
             for candidate in self._extract_image_candidates(image):
                 resolved = urljoin(url, candidate)
                 if is_techzone_source(resolved):
                     image_urls.append(resolved)
-        return CrawlPage(url=url, title=title, text=text, image_urls=list(dict.fromkeys(image_urls)))
+        return CrawlPage(
+            url=url,
+            title=title,
+            text=text,
+            image_urls=list(dict.fromkeys(image_urls)),
+            sections=sections,
+            image_records=[rec.to_dict() for rec in extract_image_records(soup, url, title)],
+        )
 
     def download_image(self, image_url: str, output_dir: Path) -> Path | None:
         if not is_techzone_source(image_url):
@@ -566,6 +641,13 @@ class TechZoneRagStore:
     def rebuild_from_sitemap(self, max_pages: int | None = None, force_full_rebuild: bool = False) -> dict[str, int]:
         crawler = TechZoneCrawler(self.settings)
         run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        # Reuse prior vision verdicts (image_url -> image_type) so a rebuild only
+        # calls vision for genuinely new images.
+        classification_cache = load_classification_cache(self.settings.data_dir / "sitemap_image_classified.jsonl")
+        # Reuse prior classification + visual flags so a rebuild never re-spends vision
+        # on known images and never loses the flags written by enrichment.
+        enriched_cache = load_enriched_cache(self.settings.image_captions_file)
+
         self.logger.info("RAG rebuild start run_id=%s max_pages=%s force_full_rebuild=%s", run_id, max_pages, force_full_rebuild)
         urls = crawler.sitemap_urls()
         if max_pages:
@@ -612,8 +694,13 @@ class TechZoneRagStore:
                 )
                 continue
 
-            chunks = _chunk_text(page.text)
-            if not chunks:
+            section_chunks: list[tuple[str, str, str, str]] = []
+            for section in page.sections:
+                for chunk in _chunk_text(section.text):
+                    section_chunks.append((chunk, section.title, section.url, section.text[:1000]))
+            if not section_chunks:
+                section_chunks = [(chunk, page.title, page.url, page.text[:1000]) for chunk in _chunk_text(page.text)]
+            if not section_chunks:
                 failed_pages += 1
                 self._append_audit(
                     audit_file,
@@ -645,7 +732,7 @@ class TechZoneRagStore:
                         "run_id": run_id,
                         "url": page.url,
                         "status": "page_unchanged_skipped",
-                        "chunks": len(chunks),
+                        "chunks": len(section_chunks),
                     },
                 )
                 continue
@@ -654,21 +741,25 @@ class TechZoneRagStore:
                 if existing_ids:
                     self.collection.delete(ids=existing_ids)
 
-                embeddings = self.embedding_service.embed_texts(chunks)
-                chunk_ids = [f"{self._hash_text(page.url)[:12]}_{page_idx}_{chunk_idx}" for chunk_idx in range(len(chunks))]
+                chunk_texts = [chunk for chunk, _section_title, _section_url, _section_text in section_chunks]
+                embeddings = self.embedding_service.embed_texts(chunk_texts)
+                chunk_ids = [f"{self._hash_text(page.url)[:12]}_{page_idx}_{chunk_idx}" for chunk_idx in range(len(section_chunks))]
                 metadatas = [
                     {
                         "url": page.url,
                         "title": page.title,
                         "chunk_index": i,
                         "page_hash": page_hash,
-                        "chunk_hash": self._hash_text(chunks[i]),
+                        "chunk_hash": self._hash_text(section_chunks[i][0]),
+                        "section_title": section_chunks[i][1],
+                        "section_url": section_chunks[i][2],
+                        "section_text": section_chunks[i][3],
                     }
-                    for i in range(len(chunks))
+                    for i in range(len(section_chunks))
                 ]
 
-                self.collection.upsert(ids=chunk_ids, embeddings=embeddings, documents=chunks, metadatas=metadatas)
-                indexed_chunks += len(chunks)
+                self.collection.upsert(ids=chunk_ids, embeddings=embeddings, documents=chunk_texts, metadatas=metadatas)
+                indexed_chunks += len(section_chunks)
                 upserted_pages += 1
 
             # Remove previous image rows/files for this page before re-ingesting.
@@ -681,7 +772,36 @@ class TechZoneRagStore:
                     deleted_images += 1
 
             accepted_images = 0
-            for image_url in page.image_urls:
+            for rec in page.image_records:
+                image_url = rec.get("image_url", "")
+                if not image_url:
+                    continue
+                # 1) reuse full prior verdict + flags if we have them; 2) else reuse a
+                #    cached category (skip non-keep); 3) else one combined vision call.
+                flags = None
+                cached = enriched_cache.get(image_url)
+                if cached is not None:
+                    image_type = cached.get("diagram_kind") or "architecture_diagram"
+                    flags = cached.get("flags")
+                else:
+                    image_type = classification_cache.get(image_url)
+                    if image_type is None:
+                        result = classify_image(self.foundry, rec)
+                        image_type = result.get("image_type", "other")
+                        flags = result
+                        classification_cache[image_url] = image_type
+                if image_type not in KEEP_TYPES:
+                    self._append_audit(
+                        audit_file,
+                        {
+                            "run_id": run_id,
+                            "url": page.url,
+                            "image_url": image_url,
+                            "status": "image_rejected_non_architecture",
+                            "image_type": image_type,
+                        },
+                    )
+                    continue
                 local_path = crawler.download_image(image_url, self.settings.images_dir)
                 if not local_path:
                     self._append_audit(
@@ -694,36 +814,7 @@ class TechZoneRagStore:
                         },
                     )
                     continue
-                if not self._is_architecture_diagram(local_path=local_path, image_url=image_url, page_title=page.title):
-                    self._append_audit(
-                        audit_file,
-                        {
-                            "run_id": run_id,
-                            "url": page.url,
-                            "image_url": image_url,
-                            "status": "image_rejected_non_architecture",
-                        },
-                    )
-                    continue
-                caption = ""
-                try:
-                    caption = self.foundry.caption_image_from_url(
-                        image_url=image_url,
-                        page_url=page.url,
-                        page_title=page.title,
-                    )
-                except Exception:
-                    caption = ""
-                caption = self._align_caption_with_page(caption, page.title, page.url)
-                row = {
-                    "page_url": page.url,
-                    "image_url": image_url,
-                    "local_path": str(local_path),
-                    "caption": caption,
-                    "title": page.title,
-                    "image_type": "architecture_diagram",
-                    "caption_version": CAPTION_SCHEMA_VERSION,
-                }
+                row = build_v3_caption_row(rec, image_type, str(local_path), flags=flags)
                 caption_rows.append(row)
                 indexed_images += 1
                 accepted_images += 1
@@ -735,10 +826,9 @@ class TechZoneRagStore:
                         "image_url": image_url,
                         "local_path": str(local_path),
                         "status": "image_accepted",
+                        "image_type": image_type,
                     },
                 )
-                if accepted_images >= self.settings.max_images_per_page:
-                    break
 
             page_elapsed = time.perf_counter() - page_started
             self._append_audit(
@@ -747,7 +837,7 @@ class TechZoneRagStore:
                     "run_id": run_id,
                     "url": page.url,
                     "status": "page_indexed",
-                    "chunks": len(chunks),
+                    "chunks": len(section_chunks),
                     "images_found": len(page.image_urls),
                     "images_accepted": accepted_images,
                     "seconds": round(page_elapsed, 2),
@@ -815,12 +905,16 @@ class TechZoneRagStore:
         # Conservative fallback when vision is unavailable: keep only very likely architecture frames.
         return width >= 900 and height >= 500 and ratio <= 3.8
 
+
     def index_stats(self) -> dict[str, int]:
         chunks = self.collection.count()
         images = 0
         if self.settings.image_captions_file.exists():
-            images = sum(1 for line in self.settings.image_captions_file.read_text(encoding="utf-8").splitlines() if line.strip())
+            # Count lines without loading full JSON content — much faster for large files.
+            with self.settings.image_captions_file.open("r", encoding="utf-8") as f:
+                images = sum(1 for line in f if line.strip())
         return {"chunks": int(chunks), "images": int(images)}
+
 
     def search(self, query: str, top_k: int = 6) -> list[RetrievedChunk]:
         vector = self.embedding_service.embed_text(query)
@@ -844,9 +938,56 @@ class TechZoneRagStore:
                     title=str(meta.get("title", "")),
                     content=str(doc),
                     score=float(distance),
+                    section_title=str(meta.get("section_title", "")),
+                    section_url=str(meta.get("section_url", "")),
                 )
             )
         return chunks
+
+    def resolve_question_source(self, source_hint: Resource | None) -> Resource | None:
+        if not source_hint:
+            return None
+        fallback = Resource(
+            title=source_hint.title,
+            url=source_hint.url,
+            summary=source_hint.summary,
+        )
+        query = (source_hint.summary or source_hint.title).strip()
+        try:
+            if self.collection.count() <= 0 or not query:
+                return fallback
+            vector = self.embedding_service.embed_text(query)
+            result = self.collection.query(
+                query_embeddings=[vector],
+                n_results=8,
+                include=["documents", "metadatas", "distances"],
+            )
+        except Exception:
+            return fallback
+
+        preferred_url = self._canonical_url(source_hint.url)
+        metas = result.get("metadatas", [[]])[0]
+        distances = result.get("distances", [[]])[0]
+        ranked: list[tuple[float, dict]] = []
+        for meta, distance in zip(metas, distances):
+            page_url = self._canonical_url(str(meta.get("url", "")))
+            section_title = str(meta.get("section_title", "")).strip()
+            section_url = str(meta.get("section_url", "")).strip()
+            if not page_url or not section_title:
+                continue
+            score = float(distance)
+            if page_url == preferred_url:
+                score -= 0.25
+            ranked.append((score, meta))
+        if not ranked:
+            return fallback
+        ranked.sort(key=lambda item: item[0])
+        best = ranked[0][1]
+        page_title = str(best.get("title", "")).strip() or source_hint.title
+        section_title = str(best.get("section_title", "")).strip()
+        section_url = str(best.get("section_url", "")).strip() or str(best.get("url", "")).strip() or source_hint.url
+        title = f"{page_title} > {section_title}" if section_title and section_title.lower() not in page_title.lower() else page_title
+        return Resource(title=title, url=section_url, summary=query)
 
     def best_images_for_urls(self, urls: list[str], limit: int = 6) -> list[dict[str, str]]:
         rows = self._load_caption_rows()
@@ -894,11 +1035,14 @@ class TechZoneRagStore:
         ("Core Components - Logical View", "logical architecture overview connection server core components"),
         ("Core Components - Block Design", "pod block design management and user resource pools"),
         ("Sizing Best Practices - Configurations", "sizing configuration vm specifications capacity resource pool"),
+        ("Connection Server Authentication Flow", "connection server authentication active directory horizon client protocol session"),
+        ("Connection Server Load Balancing", "local load balancer connection servers horizon clients agents"),
         ("Access Architecture", "external access unified access gateway UAG edge remote access"),
         ("Networking - Network Flows and Ports", "network ports flows traffic ports diagram"),
-        ("Networking - Internal Connections", "internal connection blast pcoip rdp protocol"),
+        ("Networking - Internal Blast Connections", "internal blast connection network ports connection server horizon agent"),
         ("Networking - External Connections", "external gateway connection blast pcoip rdp protocol"),
-        ("Overall Design", "reference architecture overall deployment environment infrastructure dmz"),
+        ("Environment Infrastructure", "environment infrastructure design management servers desktop pools horizon domains"),
+        ("Overall Design", "reference architecture overall deployment horizon connection server desktops apps"),
     )
     _GENERIC_SECTIONS: tuple[tuple[str, str], ...] = (
         ("Logical Architecture", "logical architecture overview components"),
@@ -906,6 +1050,15 @@ class TechZoneRagStore:
         ("Networking & Ports", "network ports flows traffic protocol"),
         ("Overall Design", "reference architecture overall deployment design"),
     )
+
+    def _horizon_8_sections_for_answers(self, answers: dict[str, str]) -> tuple[tuple[str, str], ...]:
+        if str(answers.get("access_type", "")).lower() != "internal users only":
+            return self._HORIZON_8_SECTIONS
+        return tuple(
+            section
+            for section in self._HORIZON_8_SECTIONS
+            if section[0] not in {"Access Architecture", "Networking - External Connections"}
+        )
 
     @staticmethod
     def _image_row_id(row: dict[str, str]) -> str:
@@ -1023,7 +1176,7 @@ class TechZoneRagStore:
 
         base_query = self._build_image_query(selected_products, answers)
         preferred = self._canonical_url_set(reference_urls)
-        sections = self._HORIZON_8_SECTIONS if "horizon_8" in selected_products else self._GENERIC_SECTIONS
+        sections = self._horizon_8_sections_for_answers(answers) if "horizon_8" in selected_products else self._GENERIC_SECTIONS
         valid_paths = {str(row.get("local_path", "")) for row in rows}
 
         selected: list[dict[str, str]] = []
@@ -1068,6 +1221,164 @@ class TechZoneRagStore:
                 selected.append(chosen)
         return selected[:limit]
 
+    def _filter_horizon_8_rows_for_answers(
+        self,
+        rows: list[dict[str, str]],
+        answers: dict[str, str],
+    ) -> list[dict[str, str]]:
+        hosting = str(answers.get("hosting_strategy", "")).lower()
+        site = str(answers.get("site_topology", "")).lower()
+        access_type = str(answers.get("access_type", "")).lower()
+        track = str(answers.get("horizon_8_arch_track", "")).lower()
+        protocol_scope = str(answers.get("horizon_protocol_scope", "Blast Extreme only")).lower()
+
+        internal_safe_page_tokens = (
+            "horizon-8-architecture",
+            "network-ports-horizon-8",
+            "understand-and-troubleshoot-horizon-connections",
+            "environment-infrastructure-design",
+            "reference-architecture-vm-specifications",
+        )
+        internal_bad_image_tokens = (
+            # Visible UAG / Access Gateway / Horizon Edge labels are present in these
+            # images even though some generated captions are too generic to say so.
+            "98244-0114-095435-4",
+            "98244-0114-095435-6",
+            "85713-0401-165241-2",
+            "85713-0401-165241-6",
+            "85713-0401-165241-7",
+        )
+        blast_only_bad_image_tokens = (
+            "96104-1203-113102-2",
+            "96104-1203-113102-6",
+            "96104-1203-113102-7",
+            "85624-0401-144604-6",
+            "85624-0401-144604-7",
+        )
+        horizon_relevant_tokens = (
+            "horizon",
+            "connection server",
+            "desktop pool",
+            "desktop pools",
+            "rds farm",
+            "vdi",
+            "blast",
+            "network-ports-horizon-8",
+            "understand-and-troubleshoot-horizon-connections",
+            "reference-architecture-vm-specifications",
+            "environment-infrastructure-design",
+        )
+        cloud_tokens = (
+            "horizon cloud",
+            "cloud service",
+            "control plane",
+            "google cloud",
+            "aws",
+            "amazon ec2",
+            "amazon workspaces",
+            "alibaba cloud",
+            "oracle cloud",
+            "vmware cloud on aws",
+            "horizon-8-vmware-cloud-aws",
+            "azure vmware solution",
+            "horizon-8-azure-vmware-solution",
+            "google cloud vmware engine",
+            "horizon-8-google-cloud-vmware-engine",
+            "oracle cloud vmware solution",
+            "horizon-8-oracle-cloud-vmware-solution",
+            "alibaba cloud vmware service",
+            "horizon-8-alibaba-cloud-vmware-service",
+        )
+        track_tokens: tuple[str, ...] = ()
+        if "vmware cloud on aws" in track:
+            track_tokens = ("vmware cloud on aws", "horizon-8-vmware-cloud-aws")
+        elif "azure vmware solution" in track:
+            track_tokens = ("azure vmware solution", "horizon-8-azure-vmware-solution")
+        elif "google cloud vmware engine" in track:
+            track_tokens = ("google cloud vmware engine", "horizon-8-google-cloud-vmware-engine")
+        elif "oracle cloud vmware solution" in track:
+            track_tokens = ("oracle cloud vmware solution", "horizon-8-oracle-cloud-vmware-solution")
+        elif "alibaba cloud vmware service" in track:
+            track_tokens = ("alibaba cloud vmware service", "horizon-8-alibaba-cloud-vmware-service")
+
+        blocked_access_tokens = (
+            "uag",
+            "unified access",
+            "unified access gateway",
+            "unified access gateways",
+            "external",
+            "external access",
+            "remote access",
+            "dmz",
+            "edge gateway",
+            "horizon edge",
+            "horizon edge gateway",
+            "secure gateway",
+            "secure gateways",
+            "security server",
+        )
+        blocked_site_tokens = ("multi-site", "multisite", "active/passive", "active/active", "global", "per-site")
+        non_hld_tokens = (
+            "microsoft teams optimization",
+            "teams optimization",
+            "microsoft office 365",
+            "office 365",
+            "google beyondcorp",
+            "beyondcorp",
+            "omnissa-blast-extreme-optimization-guide",
+            "blast extreme optimization guide",
+            "horizon client selecting blast",
+            "horizon client blast extreme settings",
+            "protocol settings",
+        )
+        non_blast_protocol_tokens = (
+            "all display protocols",
+            "pcoip",
+            "pc-oip",
+            "pc/oip",
+            "microsoft rdp",
+            " rdp ",
+            "rdp session",
+            "internal rdp",
+            "blast + pcoip",
+            "blast + pcoip + rdp",
+        )
+
+        filtered: list[dict[str, str]] = []
+        for row in rows:
+            text = self._row_search_text(row)
+            page_url = self._canonical_url(str(row.get("page_url", ""))).lower()
+            combined = f"{text} {page_url}"
+
+            if access_type == "internal users only" and not any(token in page_url for token in internal_safe_page_tokens):
+                continue
+            if access_type == "internal users only" and any(token in combined for token in internal_bad_image_tokens):
+                continue
+            if "blast extreme only" in protocol_scope:
+                if any(token in combined for token in blast_only_bad_image_tokens):
+                    continue
+                if any(token in f" {combined} " for token in non_blast_protocol_tokens):
+                    continue
+                if ("display protocol" in combined or "protocol flows" in combined) and "blast" not in combined:
+                    continue
+            if not any(token in combined for token in horizon_relevant_tokens):
+                continue
+            if any(token in combined for token in non_hld_tokens):
+                continue
+            if hosting == "on-premises" and any(token in combined for token in cloud_tokens):
+                continue
+            if track_tokens:
+                is_cloud_architecture = any(token in combined for token in cloud_tokens)
+                is_selected_track = any(token in combined for token in track_tokens)
+                if is_cloud_architecture and not is_selected_track:
+                    continue
+            if access_type == "internal users only" and any(token in combined for token in blocked_access_tokens):
+                continue
+            if site == "single site" and any(token in combined for token in blocked_site_tokens):
+                continue
+            filtered.append(row)
+        return filtered
+
     def select_hld_images(
         self,
         selected_products: list[str],
@@ -1088,6 +1399,8 @@ class TechZoneRagStore:
             if row.get("image_type") == "architecture_diagram"
             and Path(str(row.get("local_path", ""))).exists()
         ]
+        if "horizon_8" in selected_products:
+            rows = self._filter_horizon_8_rows_for_answers(rows, answers)
         if not rows:
             return []
 
@@ -1097,12 +1410,24 @@ class TechZoneRagStore:
         except Exception as exc:
             self.logger.warning("Semantic image selection failed: %s", exc)
             semantic = []
+        if "horizon_8" in selected_products:
+            fallback = self._select_horizon_8_hld_images(rows, answers, reference_urls, limit=limit)
+            combined: list[dict[str, str]] = []
+            seen_paths: set[str] = set()
+            for row in [*semantic, *fallback]:
+                local_path = str(row.get("local_path", ""))
+                if not local_path or local_path in seen_paths:
+                    continue
+                combined.append(row)
+                seen_paths.add(local_path)
+                if len(combined) >= limit:
+                    break
+            if combined:
+                return combined
         if semantic:
             return semantic
 
-        # Fallbacks: keyword-scored horizon path, then deterministic URL match.
-        if "horizon_8" in selected_products:
-            return self._select_horizon_8_hld_images(rows, answers, reference_urls, limit=limit)
+        # Fallback: deterministic URL match for non-Horizon product sets.
         return self.best_images_for_urls(reference_urls, limit=limit)
 
     @staticmethod
@@ -1184,7 +1509,7 @@ class TechZoneRagStore:
         track = str(answers.get("horizon_8_arch_track", "")).lower()
         access = str(answers.get("horizon_access_topology", "")).lower()
         dmz = str(answers.get("horizon_dmz_design", "")).lower()
-        protocols = str(answers.get("horizon_protocol_scope", "")).lower()
+        protocols = str(answers.get("horizon_protocol_scope", "Blast Extreme only")).lower()
 
         platform_refs = tuple(
             url
@@ -1219,6 +1544,20 @@ class TechZoneRagStore:
                 8,
             ),
             (
+                "Connection Server Authentication Flow",
+                ("connection server", "authentication", "active directory", "protocol session"),
+                tuple(url for url in platform_refs if "horizon-8-architecture" in url or "understand-and-troubleshoot-horizon-connections" in url),
+                (),
+                10,
+            ),
+            (
+                "Connection Server Load Balancing",
+                ("load balancer", "connection servers", "horizon clients", "agents"),
+                tuple(url for url in platform_refs if "horizon-8-architecture" in url),
+                (),
+                10,
+            ),
+            (
                 "Access Architecture",
                 ("external access", "uag", "access architecture", "edge", "remote access"),
                 tuple(url for url in platform_refs if "unified-access-gateway" in url or "horizon-8-architecture" in url),
@@ -1233,8 +1572,8 @@ class TechZoneRagStore:
                 12,
             ),
             (
-                "Networking - Internal Connections",
-                ("internal", "blast", "pcoip", "rdp"),
+                "Networking - Internal Blast Connections",
+                ("internal", "blast", "connection server", "network ports"),
                 tuple(url for url in platform_refs if "network-ports-horizon-8" in url or "understand-and-troubleshoot-horizon-connections" in url),
                 tuple(keyword for keyword in (protocols,) if keyword),
                 10,
@@ -1247,6 +1586,13 @@ class TechZoneRagStore:
                 10,
             ),
             (
+                "Environment Infrastructure",
+                ("environment infrastructure", "management", "desktop pools", "horizon domain", "connection server"),
+                tuple(url for url in platform_refs if "environment-infrastructure-design" in url or "horizon-8-architecture" in url),
+                (),
+                10,
+            ),
+            (
                 "Overall Design",
                 ("reference architecture", "overall", "deployment architecture", "environment infrastructure", "dmz"),
                 tuple(url for url in platform_refs if any(token in url for token in ("environment-infrastructure-design", "architecture", "reference-architecture-overview"))),
@@ -1254,6 +1600,12 @@ class TechZoneRagStore:
                 10,
             ),
         ]
+        if str(answers.get("access_type", "")).lower() == "internal users only":
+            plans = [
+                plan
+                for plan in plans
+                if plan[0] not in {"Access Architecture", "Networking - External Connections"}
+            ]
 
         selected: list[dict[str, str]] = []
         used_paths: set[str] = set()

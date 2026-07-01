@@ -8,6 +8,7 @@ from PIL import Image
 from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_SHAPE
+from pptx.enum.text import MSO_AUTO_SIZE
 from pptx.util import Inches, Pt
 
 from .catalog import Product
@@ -31,6 +32,26 @@ def _clean_text(text: str, max_len: int = 420) -> str:
     cleaned = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned[:max_len]
+
+
+def _diagram_header(row: dict[str, str], idx: int, max_len: int = 140) -> str:
+    caption = _clean_text(str(row.get("caption", "")), max_len)
+    if caption:
+        return caption
+    return _clean_text(str(row.get("slide_title") or row.get("title", f"Architecture Diagram {idx}")), max_len)
+
+
+def _title_size(title: str, base_size: float = 24) -> float:
+    length = len(title or "")
+    if length > 118:
+        return min(base_size, 12)
+    if length > 95:
+        return min(base_size, 14)
+    if length > 72:
+        return min(base_size, 16)
+    if length > 54:
+        return min(base_size, 18)
+    return base_size
 
 
 @dataclass(frozen=True)
@@ -93,12 +114,13 @@ class HldPptBuilder:
         else:
             fill.fore_color.rgb = BG
 
-        band = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(13.333), Inches(0.9))
+        band_h = Inches(1.05)
+        band = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(13.333), band_h)
         band.fill.solid()
         band.fill.fore_color.rgb = TITLE_BAND
         band.line.fill.background()
 
-        accent = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(0.9), Inches(13.333), Inches(0.05))
+        accent = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), band_h, Inches(13.333), Inches(0.05))
         accent.fill.solid()
         accent.fill.fore_color.rgb = ACCENT
         accent.line.fill.background()
@@ -111,17 +133,27 @@ class HldPptBuilder:
                 profile.title_height,
             )
         else:
-            title_box = slide.shapes.add_textbox(Inches(0.4), Inches(0.14), Inches(12.6), Inches(0.58))
+            title_box = slide.shapes.add_textbox(Inches(0.4), Inches(0.08), Inches(12.55), Inches(0.86))
+        text_frame = title_box.text_frame
+        text_frame.clear()
+        text_frame.word_wrap = True
+        text_frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+        text_frame.margin_top = Inches(0.02)
+        text_frame.margin_bottom = Inches(0.02)
+        text_frame.margin_left = Inches(0.04)
+        text_frame.margin_right = Inches(0.04)
+        p = text_frame.paragraphs[0]
+        clean_title = _clean_text(title, max_len=150)
+        p.text = clean_title
         p = title_box.text_frame.paragraphs[0]
-        p.text = _clean_text(title, max_len=140)
         if profile:
             p.font.name = profile.title_font_name or FONT_PRIMARY
-            p.font.size = Pt(max(14, profile.title_font_size_pt))
+            p.font.size = Pt(max(10, _title_size(clean_title, profile.title_font_size_pt)))
             p.font.bold = profile.title_font_bold
             p.font.color.rgb = RGBColor(*profile.title_font_rgb)
         else:
             p.font.name = FONT_PRIMARY
-            p.font.size = Pt(24)
+            p.font.size = Pt(_title_size(clean_title, 24))
             p.font.bold = True
             p.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
         return slide
@@ -153,7 +185,7 @@ class HldPptBuilder:
         idx: int,
         profile: TemplateProfile | None,
     ) -> None:
-        title = row.get("slide_title") or row.get("title", f"Architecture Diagram {idx}")
+        title = _diagram_header(row, idx)
         slide = self._base_slide(prs, title, profile)
         image_path = Path(str(row.get("local_path", "")))
         if image_path.exists():
@@ -167,7 +199,7 @@ class HldPptBuilder:
                     profile.image_height,
                 )
             else:
-                self._add_image_contain(slide, image_path, Inches(0.55), Inches(1.1), Inches(12.25), Inches(5.85))
+                self._add_image_contain(slide, image_path, Inches(0.55), Inches(1.25), Inches(12.25), Inches(5.6))
 
     @staticmethod
     def _context_bullets(questionnaire: dict[str, str]) -> list[str]:
