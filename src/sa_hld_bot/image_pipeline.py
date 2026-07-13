@@ -67,6 +67,31 @@ def clean_title(page_title: str) -> str:
     return re.sub(r"\s*\|\s*Omnissa\s*$", "", page_title or "").strip()
 
 
+MULTI_SITE_TERMS = (
+    "multi-site", "multisite", "multi site", "multi-datacentre", "multi-datacenter",
+    "active-active", "active/active", "active active",
+    "active-passive", "active/passive", "active passive",
+    "stretched cluster", "stretched vsan", "vsan stretched",
+    "preferred site", "secondary site", "witness site", "data site to data site",
+    "site 1", "site 2", "site 3",
+)
+
+
+def infer_site_topology(text: str, existing: str = "") -> str:
+    t = f" {(text or '').lower()} "
+    if "cloud pod" in t or " cpa " in t:
+        return "cloud_pod"
+    if "active-active" in t or "active/active" in t or "active active" in t:
+        return "multisite_active_active"
+    if "active-passive" in t or "active/passive" in t or "active passive" in t:
+        return "multisite_active_passive"
+    if any(term in t for term in MULTI_SITE_TERMS):
+        return "multisite"
+    if "single-site" in t or "single site" in t:
+        return "single_site"
+    return existing or ""
+
+
 def load_classification_cache(path: Path) -> dict:
     """image_url -> image_type, from a prior classified JSONL (avoids repeat vision)."""
     out: dict[str, str] = {}
@@ -136,6 +161,15 @@ def build_v3_caption_row(rec: dict, image_type: str, local_path: str, flags: dic
     caption = (rec.get("figure_caption") or "").strip() or heading or clean_title(rec.get("page_title", ""))
     components = hints.get("components_shown", []) or []
     load_balancer = ("load_balancer" in components) or ("load balanc" in (rec.get("embed_text", "") or "").lower())
+    topology_text = " ".join([
+        rec.get("page_title", ""),
+        heading,
+        caption,
+        rec.get("figure_caption", ""),
+        rec.get("context_text", ""),
+        rec.get("embed_text", ""),
+    ])
+    site_topology = infer_site_topology(topology_text, hints.get("site_topology", ""))
     return {
         "page_url": page_url,
         "image_url": rec.get("image_url", ""),
@@ -155,7 +189,7 @@ def build_v3_caption_row(rec: dict, image_type: str, local_path: str, flags: dic
         "load_balancer": bool(load_balancer),
         "dmz_design": hints.get("dmz_design", "none"),
         "protocols": hints.get("protocols", []),
-        "site_topology": hints.get("site_topology", ""),
+        "site_topology": site_topology,
         "cloud_platform": cloud_platform_for(page_url),
         "components_shown": components,
         "keep": True,

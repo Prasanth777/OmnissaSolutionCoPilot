@@ -109,13 +109,21 @@ def derive_dimension_hints(text: str) -> dict:
 
     protocols = [p for p, kw in (("blast", "blast"), ("pcoip", "pcoip"), ("rdp", "rdp")) if kw in t]
 
+    multi_site_terms = (
+        "multi-site", "multisite", "multi site", "multi-datacentre", "multi-datacenter",
+        "active-active", "active/active", "active active",
+        "active-passive", "active/passive", "active passive",
+        "stretched cluster", "stretched vsan", "vsan stretched",
+        "preferred site", "secondary site", "witness site", "data site to data site",
+        "site 1", "site 2", "site 3",
+    )
     if "cloud pod" in t or "cpa" in t:
         site = "cloud_pod"
-    elif "active-active" in t or "active/active" in t:
+    elif "active-active" in t or "active/active" in t or "active active" in t:
         site = "multisite_active_active"
-    elif "active-passive" in t or "active/passive" in t:
+    elif "active-passive" in t or "active/passive" in t or "active passive" in t:
         site = "multisite_active_passive"
-    elif "multi-site" in t or "multisite" in t:
+    elif any(term in t for term in multi_site_terms):
         site = "multisite"
     elif "single-site" in t or "single site" in t:
         site = "single_site"

@@ -28,6 +28,17 @@ H8_REFS = [
     "https://techzone.omnissa.com/resource/unified-access-gateway-architecture",
 ]
 
+MULTI_SITE_TERMS = (
+    "multi-site", "multisite", "multi site", "active-active", "active/active",
+    "active-passive", "active/passive", "stretched cluster", "stretched vsan",
+    "preferred site", "secondary site", "witness site", "data site to data site",
+)
+
+def row_text(row: dict) -> str:
+    return " ".join(str(row.get(k, "")) for k in (
+        "title", "caption", "figure_caption", "section_heading", "embed_text", "page_url"
+    )).lower()
+
 FLOWS = [
     {
         "name": "internal / single / on-prem",
@@ -35,6 +46,8 @@ FLOWS = [
                     "hosting_strategy": "On-premises", "horizon_protocol_scope": "Blast Extreme only"},
         "forbid": lambda r: r.get("uag_present") or r.get("dmz_design") in ("single", "double")
                             or r.get("access_scope") in ("external", "both") or r.get("cloud_platform")
+                            or r.get("site_topology") in ("multisite", "multisite_active_active", "multisite_active_passive", "cloud_pod")
+                            or any(term in row_text(r) for term in MULTI_SITE_TERMS)
                             or any(k in (r.get("figure_caption", "") or "").lower()
                                    for k in ("unsupported", "design approach", "design methodology",
                                              "app volumes", "gpu-accelerated", "service definition")),

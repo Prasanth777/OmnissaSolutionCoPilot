@@ -1147,8 +1147,11 @@ class TechZoneRagStore:
             "access_type",
             "mfa_required",
             "mfa_provider",
+            "load_balancer",
+            "load_balancer_placement",
             "uag_nic_config",
             "horizon_8_arch_track",
+            "horizon_external_access",
             "horizon_access_topology",
             "horizon_dmz_design",
             "horizon_protocol_scope",
@@ -1507,7 +1510,10 @@ class TechZoneRagStore:
     ) -> list[dict[str, str]]:
         canonical_refs = self._canonical_url_set(reference_urls)
         track = str(answers.get("horizon_8_arch_track", "")).lower()
-        access = str(answers.get("horizon_access_topology", "")).lower()
+        access = " ".join(
+            str(answers.get(key, "")).lower()
+            for key in ("horizon_external_access", "horizon_access_topology", "load_balancer", "load_balancer_placement")
+        )
         dmz = str(answers.get("horizon_dmz_design", "")).lower()
         protocols = str(answers.get("horizon_protocol_scope", "Blast Extreme only")).lower()
 

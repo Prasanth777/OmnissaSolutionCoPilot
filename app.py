@@ -18,7 +18,7 @@ if str(SRC) not in sys.path:
 
 # Lightweight imports only — keep the initial page render fast.
 # Heavy modules (chromadb, rag, agents) are imported lazily inside initialize_agents().
-from sa_hld_bot.catalog import FAMILY_CHOICES, PRODUCTS, Question, compile_reference_resources, effective_answers, filtered_question_options, normalize_answer, question_source, visible_questions
+from sa_hld_bot.catalog import FAMILY_CHOICES, PRODUCTS, Question, compile_reference_resources, effective_answers, essential_question_keys, filtered_question_options, normalize_answer, question_source, visible_questions
 from sa_hld_bot.config import load_settings
 from sa_hld_bot.image_followup import apply_command, looks_like_image_command, parse_command
 from sa_hld_bot.sessions import delete_session, list_sessions, load_session, save_session
@@ -49,8 +49,13 @@ def bootstrap_state() -> None:
     st.session_state.setdefault("last_references", [])
     st.session_state.setdefault("rag_narrative", {})
     st.session_state.setdefault("current_session_id", "")
+    st.session_state.setdefault("optional_questions_consent", "")
+    st.session_state.setdefault("optional_questions_done", False)
+    st.session_state.setdefault("figure_candidates", [])
+    st.session_state.setdefault("figure_excluded", [])
     st.session_state.setdefault("use_sample_template", True)
     st.session_state.setdefault("sample_template_path", "/Users/prasanththangaraj/Downloads/test-for AI.pptx")
+    st.session_state.setdefault("_visible_questions_cache", {"signature": "", "questions": []})
 
 
 def chat_add(role: str, content: str) -> None:
@@ -66,14 +71,100 @@ def first_question():
 
 def pending_questions():
     missing = []
-    for question in visible_questions(st.session_state.selected_products, st.session_state.answers):
+    essential_only = None
+    if st.session_state.get("optional_questions_done"):
+        essential_only = essential_question_keys(st.session_state.selected_products, st.session_state.answers)
+    for question in current_visible_questions():
+        if essential_only is not None and question.key not in essential_only:
+            continue
         if not normalize_answer(st.session_state.answers.get(question.key)):
             missing.append(question)
     return missing
 
 
+def unanswered_optional_questions() -> list[Question]:
+    essential = essential_question_keys(st.session_state.selected_products, st.session_state.answers)
+    return [
+        question
+        for question in visible_questions(st.session_state.selected_products, st.session_state.answers, include_optional=True)
+        if question.key not in essential and not normalize_answer(st.session_state.answers.get(question.key))
+    ]
+
+
+def accept_optional_questions() -> None:
+    st.session_state.optional_questions_consent = "yes"
+    st.session_state.optional_questions_done = False
+    st.session_state.active_question_key = ""
+    clear_question_cache()
+
+
+def decline_optional_questions() -> None:
+    st.session_state.optional_questions_consent = "no"
+    st.session_state.optional_questions_done = True
+    st.session_state.active_question_key = ""
+    clear_question_cache()
+
+
+def finish_optional_questions() -> None:
+    st.session_state.optional_questions_done = True
+    st.session_state.active_question_key = ""
+    clear_question_cache()
+
+
+def reset_optional_questions_state() -> None:
+    """Reset per-interview state: optional-question consent and figure curation."""
+    st.session_state.optional_questions_consent = ""
+    st.session_state.optional_questions_done = False
+    st.session_state.figure_candidates = []
+    st.session_state.figure_excluded = []
+
+
+def compute_figure_candidates() -> list[dict]:
+    """Run answer-aware diagram selection (no LLM calls) for the review panel."""
+    _settings, _rag_store, _orchestrator = get_agents()
+    if not _rag_store:
+        return []
+    answers = effective_answers(st.session_state.answers)
+    product_keys = st.session_state.selected_products
+    resources = compile_reference_resources(product_keys)
+    refs = [resource.url for resource in resources] + derive_solution_references(product_keys, answers)
+    from sa_hld_bot.image_select import select_hld_images
+
+    return select_hld_images(
+        _rag_store,
+        selected_products=product_keys,
+        answers=answers,
+        reference_urls=list(dict.fromkeys(refs)),
+        limit=10,
+    )
+
+
+def clear_question_cache() -> None:
+    st.session_state._visible_questions_cache = {"signature": "", "questions": []}
+
+
+def current_visible_questions() -> list[Question]:
+    include_optional = st.session_state.get("optional_questions_consent", "") == "yes"
+    signature = hashlib.sha1(
+        json.dumps(
+            {
+                "products": st.session_state.selected_products,
+                "answers": st.session_state.answers,
+                "include_optional": include_optional,
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    cache = st.session_state.get("_visible_questions_cache", {})
+    if cache.get("signature") == signature:
+        return list(cache.get("questions", []))
+    questions = visible_questions(st.session_state.selected_products, st.session_state.answers, include_optional=include_optional)
+    st.session_state._visible_questions_cache = {"signature": signature, "questions": questions}
+    return questions
+
+
 def prune_hidden_answers() -> None:
-    visible_keys = {question.key for question in visible_questions(st.session_state.selected_products, st.session_state.answers)}
+    visible_keys = {question.key for question in current_visible_questions()}
     stale_keys = [key for key in st.session_state.answers if key not in visible_keys]
     for key in stale_keys:
         st.session_state.answers.pop(key, None)
@@ -92,14 +183,6 @@ def ask_next_question_if_needed() -> None:
         return
     if st.session_state.active_question_key == next_q.key:
         return
-    all_visible = visible_questions(st.session_state.selected_products, st.session_state.answers)
-    q_index = 1
-    for idx, question in enumerate(all_visible, start=1):
-        if question.key == next_q.key:
-            q_index = idx
-            break
-    hint = f"\n\nHint: {next_q.help_text}" if next_q.help_text else ""
-    chat_add("assistant", f"Question {q_index} of {len(all_visible)}: {next_q.prompt}{hint}")
     st.session_state.active_question_key = next_q.key
 
 
@@ -253,19 +336,31 @@ def sync_selection_state() -> None:
         st.session_state.generated_signature = ""
         st.session_state.last_references = []
         st.session_state.current_session_id = ""
+        reset_optional_questions_state()
+        clear_question_cache()
 
 
-def answer_question(value: str) -> None:
+def _answer_value(value: str | list[str] | tuple[str, ...]) -> str:
+    if isinstance(value, (list, tuple)):
+        parts = [normalize_answer(item) for item in value if normalize_answer(item)]
+        if len(parts) > 1:
+            parts = [item for item in parts if item != "Unknown / to be confirmed"]
+        return "; ".join(dict.fromkeys(parts))
+    return normalize_answer(value)
+
+
+def answer_question(value: str | list[str] | tuple[str, ...]) -> None:
     question = first_question()
     if not question:
         return
-    normalized = normalize_answer(value)
+    normalized = _answer_value(value)
     if not normalized:
         return
     st.session_state.answers[question.key] = normalized
+    clear_question_cache()
     prune_hidden_answers()
+    clear_question_cache()
     st.session_state.generated_signature = ""
-    chat_add("user", normalized)
     st.session_state.active_question_key = ""
     ask_next_question_if_needed()
 
@@ -316,11 +411,16 @@ def derive_solution_references(product_keys: list[str], answers: dict[str, str])
         refs.append("https://techzone.omnissa.com/resource/horizon-8-architecture")
         refs.append("https://techzone.omnissa.com/resource/horizon-8-configuration")
         refs.append("https://techzone.omnissa.com/resource/reference-architecture-vm-specifications")
+        refs.append("https://techzone.omnissa.com/resource/omnissa-horizon-blast-extreme-display-protocol")
         refs.append("https://techzone.omnissa.com/resource/network-ports-horizon-8")
         refs.append("https://techzone.omnissa.com/resource/understand-and-troubleshoot-horizon-connections")
         refs.append("https://techzone.omnissa.com/resource/environment-infrastructure-design")
 
-    if "load balancer" in answers.get("horizon_access_topology", "").lower():
+    load_balancer_signal = " ".join(
+        normalize_answer(answers.get(key)).lower()
+        for key in ("load_balancer", "load_balancer_placement", "horizon_external_access", "horizon_access_topology")
+    )
+    if "load balancer" in load_balancer_signal or "load balancing" in load_balancer_signal:
         refs.append("https://techzone.omnissa.com/resource/load-balancing-unified-access-gateway-horizon")
     if "dmz" in answers.get("horizon_dmz_design", "").lower():
         refs.append("https://techzone.omnissa.com/resource/unified-access-gateway-architecture")
@@ -387,9 +487,61 @@ def derive_solution_references(product_keys: list[str], answers: dict[str, str])
     return refs
 
 
-def filter_solution_references(product_keys: list[str], answers: dict[str, str], refs: list[str]) -> list[str]:
+def _horizon_reference_allowed(product_keys: list[str], answers: dict[str, str], url: str) -> bool:
+    lower_url = url.lower().strip().rstrip("/")
+    if not lower_url or "techzone.omnissa.com" not in lower_url:
+        return False
+
+    broad_reject_tokens = (
+        "business-drivers-use-cases-and-service-definitions",
+        "workspace-one-and-horizon-reference-architecture-overview",
+        "evaluation-guide",
+        "best-practices-managing-microsoft-bitlocker",
+        "microsoft-teams-optimization-horizon",
+        "using-apple-automated-device-enrollment",
+        "blocking-unwanted-apps-managed-ios-devices",
+        "managing-updates-macos",
+        "using-workspace-one-manage-operating-system-updates-macos-devices",
+        "configuring-tunnel-edge-service-workspace-one",
+        "getting-started-workspace-one-experience-management",
+        "introduction-horizon-citrix-practitioners",
+        "cmmc-compliance",
+        "deploying-omnissa-horizon-amazon-ec2-and-amazon-workspaces",
+        "horizon-cloud-on-microsoft-azure-first-gen",
+        "compliance-14-ncsc-cloud-security-principles",
+        "alignment-dora-requirements",
+        "alignment-nis-2-directive",
+        "alignment-nist",
+        "cloud-computing-compliance-criteria-catalogue",
+    )
+    if any(token in lower_url for token in broad_reject_tokens):
+        return False
+
+    selected_product_set = set(product_keys)
+    if "horizon_cloud" in selected_product_set and "horizon_8" not in selected_product_set:
+        horizon_cloud_tokens = {
+            "what-omnissa-horizon",
+            "horizon-cloud-service-next-gen-architecture",
+            "horizon-cloud-service-next-gen-configuration",
+            "horizon-cloud-service-next-gen-security-overview",
+            "omnissa-horizon-blast-extreme-display-protocol",
+            "understand-and-troubleshoot-horizon-connections",
+            "network-ports-horizon-8",
+        }
+        external_tokens = {
+            "unified-access-gateway-architecture",
+            "deploying-unified-access-gateway",
+            "load-balancing-unified-access-gateway-horizon",
+            "configuring-high-availability-unified-access-gateway",
+        }
+        if any(token in lower_url for token in horizon_cloud_tokens):
+            return True
+        if answers.get("access_type", "").lower() != "internal users only" and any(token in lower_url for token in external_tokens):
+            return True
+        return False
+
     if "horizon_8" not in product_keys:
-        return refs
+        return True
 
     hosting = answers.get("hosting_strategy", "").lower()
     access_type = answers.get("access_type", "").lower()
@@ -408,17 +560,53 @@ def filter_solution_references(product_keys: list[str], answers: dict[str, str],
             selected_cloud_token = url_token
             break
 
+    h8_core_tokens = {
+        "horizon-8-architecture",
+        "horizon-8-configuration",
+        "reference-architecture-vm-specifications",
+        "network-ports-horizon-8",
+        "understand-and-troubleshoot-horizon-connections",
+        "environment-infrastructure-design",
+        "omnissa-horizon-blast-extreme-display-protocol",
+        "what-omnissa-horizon",
+    }
+    external_tokens = {
+        "unified-access-gateway-architecture",
+        "deploying-unified-access-gateway",
+        "load-balancing-unified-access-gateway-horizon",
+        "configuring-high-availability-unified-access-gateway",
+    }
+    product_tokens: set[str] = set()
+    if "app_volumes" in selected_product_set:
+        product_tokens.add("app-volumes")
+    if "dynamic_environment_manager" in selected_product_set:
+        product_tokens.add("dynamic-environment-manager")
+    if "omnissa_access" in selected_product_set:
+        product_tokens.update({"workspace-one-access", "zero-trust"})
+    if "workspace_one_uem" in selected_product_set:
+        product_tokens.add("workspace-one-uem")
+
+    is_h8_cloud_ref = any(token in lower_url for token in cloud_ref_tokens.values())
+    if hosting == "on-premises" and is_h8_cloud_ref:
+        return False
+    if selected_cloud_token and is_h8_cloud_ref and selected_cloud_token not in lower_url:
+        return False
+    if any(token in lower_url for token in h8_core_tokens):
+        return True
+    if access_type != "internal users only" and any(token in lower_url for token in external_tokens):
+        return True
+    if any(token in lower_url for token in product_tokens):
+        return True
+    if selected_cloud_token and selected_cloud_token in lower_url:
+        return True
+    return False
+
+
+def filter_solution_references(product_keys: list[str], answers: dict[str, str], refs: list[str]) -> list[str]:
     filtered: list[str] = []
     for url in refs:
-        lower_url = url.lower()
-        is_h8_cloud_ref = any(token in lower_url for token in cloud_ref_tokens.values())
-        if hosting == "on-premises" and is_h8_cloud_ref:
-            continue
-        if selected_cloud_token and is_h8_cloud_ref and selected_cloud_token not in lower_url:
-            continue
-        if access_type == "internal users only" and "unified-access-gateway" in lower_url:
-            continue
-        filtered.append(url)
+        if _horizon_reference_allowed(product_keys, answers, url):
+            filtered.append(url.strip().rstrip("/"))
     return list(dict.fromkeys(filtered))
 
 
@@ -429,6 +617,33 @@ def image_source_references(image_rows: list[dict]) -> list[str]:
         if page_url:
             refs.append(page_url)
     return list(dict.fromkeys(refs))
+
+
+def session_question_log() -> list[dict[str, str]]:
+    return [
+        {
+            "key": question.key,
+            "prompt": question.prompt,
+            "answer": normalize_answer(st.session_state.answers.get(question.key)),
+        }
+        for question in current_visible_questions()
+    ]
+
+
+def selected_image_identifiers(image_rows: list[dict]) -> list[dict[str, str]]:
+    identifiers: list[dict[str, str]] = []
+    for idx, row in enumerate(image_rows or [], start=1):
+        identifiers.append({
+            "index": str(idx),
+            "topic": normalize_answer(row.get("topic")),
+            "caption": normalize_answer(row.get("figure_caption") or row.get("caption") or row.get("title")),
+            "page_url": normalize_answer(row.get("page_url")),
+            "image_url": normalize_answer(row.get("image_url")),
+            "local_path": normalize_answer(row.get("local_path")),
+            "dmz_design": normalize_answer(row.get("dmz_design")),
+            "site_topology": normalize_answer(row.get("site_topology")),
+        })
+    return identifiers
 
 
 def generate_hld_outputs(orchestrator, rag_store):
@@ -449,6 +664,7 @@ def generate_hld_outputs(orchestrator, rag_store):
         "summary": f"{hld_instruction}\nCreate a customer-facing executive summary based on these inputs:\n{context_blob}",
         "architecture": f"{hld_instruction}\nProvide a high-level architecture description for selected products {', '.join(product_keys)} and customer inputs:\n{context_blob}",
         "security": f"{hld_instruction}\nDescribe security standards, access design, RBAC, certificates, hardening, and logging for these customer constraints:\n{context_blob}",
+        "networking": f"{hld_instruction}\nDescribe the networking requirements for this design: network segments/subnets, required ports and firewall rules, load balancing, DNS/DHCP/NTP dependencies, and external access paths, for these customer constraints:\n{context_blob}",
         "operations": f"{hld_instruction}\nDescribe operational model, HA, backup, monitoring, and DR for these customer constraints:\n{context_blob}",
     }
     for key in product_keys:
@@ -476,6 +692,10 @@ def generate_hld_outputs(orchestrator, rag_store):
         reference_urls=candidate_references,
         limit=10,
     )
+    # Respect any exclusions made in the diagram review panel.
+    excluded_figures = set(st.session_state.get("figure_excluded", []))
+    if excluded_figures:
+        image_rows = [row for row in image_rows if str(row.get("local_path", "")) not in excluded_figures]
     references = filter_solution_references(
         product_keys,
         answers,
@@ -552,10 +772,14 @@ def persist_current_session() -> str:
         "references": list(st.session_state.get("last_references", [])),
         "preview_sections": st.session_state.get("ppt_preview", []),
         "image_rows": st.session_state.get("ppt_preview_images", []),
+        "questionnaire_log": session_question_log(),
+        "selected_image_identifiers": selected_image_identifiers(st.session_state.get("ppt_preview_images", [])),
         "rag_narrative": st.session_state.get("rag_narrative", {}),
         "messages": st.session_state.get("messages", []),
         "ppt_path": st.session_state.get("ppt_path", ""),
         "docx_path": st.session_state.get("docx_path", ""),
+        "optional_questions_consent": st.session_state.get("optional_questions_consent", ""),
+        "optional_questions_done": bool(st.session_state.get("optional_questions_done", False)),
     }
     sid = save_session(ROOT / "data", payload, session_id=payload["id"])
     st.session_state.current_session_id = sid
@@ -577,6 +801,9 @@ def load_session_into_state(payload: dict) -> None:
     st.session_state.messages = payload.get("messages", []) or []
     st.session_state.active_question_key = ""
     st.session_state.current_session_id = payload.get("id", "")
+    st.session_state.optional_questions_consent = payload.get("optional_questions_consent", "")
+    st.session_state.optional_questions_done = bool(payload.get("optional_questions_done", False))
+    clear_question_cache()
     st.session_state.generated_signature = _generation_signature()
 
 
@@ -653,6 +880,7 @@ with st.sidebar:
         st.session_state.rag_narrative = {}
         st.session_state.ppt_path = ""
         st.session_state.docx_path = ""
+        reset_optional_questions_state()
         st.rerun()
     _saved = list_sessions(ROOT / "data")
     if not _saved:
@@ -733,24 +961,26 @@ with st.sidebar:
         audit_log = settings.logs_dir / "ingestion_audit.jsonl"
         st.caption(f"App log: `{app_log}`")
         st.caption(f"Ingestion audit: `{audit_log}`")
+        if st.button("Load latest logs", key="load_logs_btn"):
+            if app_log.exists():
+                lines = app_log.read_text(encoding="utf-8").splitlines()[-50:]
+                st.text("\n".join(lines) if lines else "No app logs yet.")
+            else:
+                st.info("No app log file yet.")
 
-        if app_log.exists():
-            lines = app_log.read_text(encoding="utf-8").splitlines()[-50:]
-            st.text("\n".join(lines) if lines else "No app logs yet.")
+            if audit_log.exists():
+                rows = [json.loads(line) for line in audit_log.read_text(encoding="utf-8").splitlines() if line.strip()]
+                st.caption(f"Audit rows: {len(rows)}")
+                recent = rows[-10:]
+                for row in recent:
+                    status = row.get("status", "")
+                    url = row.get("url", "")
+                    image_url = row.get("image_url", "")
+                    st.write(f"- {status} | {url or image_url}")
+            else:
+                st.info("No ingestion audit file yet.")
         else:
-            st.info("No app log file yet.")
-
-        if audit_log.exists():
-            rows = [json.loads(line) for line in audit_log.read_text(encoding="utf-8").splitlines() if line.strip()]
-            st.caption(f"Audit rows: {len(rows)}")
-            recent = rows[-10:]
-            for row in recent:
-                status = row.get("status", "")
-                url = row.get("url", "")
-                image_url = row.get("image_url", "")
-                st.write(f"- {status} | {url or image_url}")
-        else:
-            st.info("No ingestion audit file yet.")
+            st.caption("Click to load logs only when troubleshooting.")
 
     st.subheader("PPT Style")
     use_template = st.checkbox(
@@ -764,7 +994,7 @@ with st.sidebar:
     st.session_state.use_sample_template = bool(use_template)
     st.session_state.sample_template_path = sample_template_path.strip()
 
-total_questions = len(visible_questions(st.session_state.selected_products, st.session_state.answers))
+total_questions = len(current_visible_questions())
 complete = total_questions - len(pending_questions())
 
 with st.container(border=True):
@@ -788,6 +1018,7 @@ with st.container(border=True):
             st.session_state.generated_signature = ""
             st.session_state.last_references = []
             st.session_state.current_session_id = ""
+            reset_optional_questions_state()
 
     with top_right:
         st.markdown("**Progress**")
@@ -833,6 +1064,7 @@ with st.container(border=True):
             st.session_state.generated_signature = ""
             st.session_state.last_references = []
             st.session_state.current_session_id = ""
+            reset_optional_questions_state()
     else:
         st.info("Select at least one family to reveal the available product tracks.")
 
@@ -843,39 +1075,144 @@ else:
     
 if st.session_state.selected_products:
     st.markdown("### 3. Guided Design Interview")
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+    if st.session_state.answers:
+        with st.expander("Answered so far", expanded=False):
+            recent_items = list(st.session_state.answers.items())[-8:]
+            for key, value in recent_items:
+                st.caption(f"{key.replace('_', ' ').title()}: {value}")
 
     next_q = first_question()
     if next_q:
+        all_visible = current_visible_questions()
+        q_index = next((idx for idx, question in enumerate(all_visible, start=1) if question.key == next_q.key), 1)
+        _essential_keys = essential_question_keys(st.session_state.selected_products, st.session_state.answers)
+        _is_optional_q = next_q.key not in _essential_keys
+        optional_tag = " (optional)" if _is_optional_q else ""
+        st.markdown(f"**Question {q_index} of {len(all_visible)}{optional_tag}: {next_q.prompt}**")
+        if _is_optional_q:
+            st.button(
+                "Skip remaining optional questions and finish",
+                key="skip_optional_questions",
+                on_click=finish_optional_questions,
+            )
+        if next_q.help_text:
+            st.caption(f"Hint: {next_q.help_text}")
         source = question_source_markdown(next_q)
         if source:
             st.caption(source)
         options = filtered_question_options(next_q, st.session_state.selected_products, st.session_state.answers)
         if options:
-            st.markdown("**Suggested answers**")
-            cols = st.columns(min(3, max(1, len(options))))
-            for idx, option in enumerate(options):
-                with cols[idx % len(cols)]:
-                    st.button(
-                        option,
-                        key=f"answer_{next_q.key}_{idx}",
-                        on_click=answer_question,
-                        args=(option,),
-                        use_container_width=True,
-                    )
+            if next_q.multi_select:
+                selected_options = st.multiselect(
+                    "Suggested answers",
+                    options,
+                    key=f"multi_answer_{next_q.key}",
+                    placeholder="Choose one or more",
+                )
+                st.button(
+                    "Use selected answers",
+                    key=f"submit_multi_{next_q.key}",
+                    on_click=answer_question,
+                    args=(selected_options,),
+                    disabled=not selected_options,
+                    use_container_width=True,
+                )
+            else:
+                st.markdown("**Suggested answers**")
+                cols = st.columns(min(3, max(1, len(options))))
+                for idx, option in enumerate(options):
+                    with cols[idx % len(cols)]:
+                        st.button(
+                            option,
+                            key=f"answer_{next_q.key}_{idx}",
+                            on_click=answer_question,
+                            args=(option,),
+                            use_container_width=True,
+                        )
 
         custom = st.chat_input("Answer input")
-        focus_chat_input()
         if custom:
             answer_question(custom)
             st.rerun()
+    elif (
+        st.session_state.get("optional_questions_consent", "") == ""
+        and not st.session_state.get("optional_questions_done")
+        and unanswered_optional_questions()
+    ):
+        optional_count = len(unanswered_optional_questions())
+        st.success("All essential design questions are complete.")
+        st.markdown(
+            f"**Would you like to answer additional optional questions to further refine the HLD?** "
+            f"There are up to {optional_count} optional questions covering areas like business drivers, "
+            "scope, backup, monitoring, and operational details. You can skip them at any point."
+        )
+        consent_cols = st.columns(2)
+        with consent_cols[0]:
+            st.button(
+                "Yes, ask the optional questions",
+                key="accept_optional_questions",
+                type="primary",
+                use_container_width=True,
+                on_click=accept_optional_questions,
+            )
+        with consent_cols[1]:
+            st.button(
+                "No, continue with essentials only",
+                key="decline_optional_questions",
+                use_container_width=True,
+                on_click=decline_optional_questions,
+            )
     else:
         st.success("Questionnaire complete.")
         est_seconds = estimate_ppt_generation_seconds()
         st.info(f"Estimated PPT generation time: ~{est_seconds // 60}m {est_seconds % 60}s")
         generation_sig = _generation_signature()
+
+        with st.expander("Review architecture diagrams (optional)", expanded=False):
+            st.caption(
+                "Preview the diagrams selected for this design based on your answers. "
+                "Untick any diagram you don't want in the generated HLD."
+            )
+            if st.button("Preview diagram selection", key="preview_figures_btn"):
+                st.session_state.figure_candidates = compute_figure_candidates()
+                valid_paths = {str(row.get("local_path", "")) for row in st.session_state.figure_candidates}
+                st.session_state.figure_excluded = [p for p in st.session_state.get("figure_excluded", []) if p in valid_paths]
+                if not st.session_state.figure_candidates:
+                    st.warning("No eligible diagrams found. Build the Tech Zone RAG store first (sidebar).")
+            _candidates = st.session_state.get("figure_candidates", [])
+            if _candidates:
+                from sa_hld_bot.image_select import figure_attribute_tags
+                _excluded = set(st.session_state.get("figure_excluded", []))
+                for _idx, _row in enumerate(_candidates):
+                    _lp = str(_row.get("local_path", ""))
+                    fig_cols = st.columns([2, 3])
+                    with fig_cols[0]:
+                        try:
+                            st.image(_lp, use_container_width=True)
+                        except Exception:
+                            st.caption("(image preview unavailable)")
+                    with fig_cols[1]:
+                        st.markdown(f"**{_row.get('slide_title') or _row.get('caption') or 'Diagram'}**")
+                        if _row.get("caption"):
+                            st.caption(str(_row.get("caption")))
+                        _tags = figure_attribute_tags(_row)
+                        if _tags:
+                            st.caption("Attributes: " + " · ".join(_tags))
+                        if _row.get("page_url"):
+                            st.caption(f"Source: {_row.get('page_url')}")
+                        _keep = st.checkbox(
+                            "Include in HLD",
+                            value=_lp not in _excluded,
+                            key=f"figure_keep_{_idx}",
+                        )
+                        if _keep:
+                            _excluded.discard(_lp)
+                        else:
+                            _excluded.add(_lp)
+                    st.divider()
+                st.session_state.figure_excluded = sorted(_excluded)
+                _kept = len(_candidates) - len([p for p in _excluded if p in {str(r.get('local_path','')) for r in _candidates}])
+                st.caption(f"{_kept} of {len(_candidates)} diagrams will be included.")
 
         st.caption("You can ask follow-up design questions or edit the diagrams.")
         user_q = st.chat_input(
@@ -883,7 +1220,6 @@ if st.session_state.selected_products:
             "'add a True SSO diagram', 'use double DMZ', 'regenerate')",
             key="post_question",
         )
-        focus_chat_input()
         if user_q:
             chat_add("user", user_q)
             _settings, _rag_store, _orchestrator = get_agents()
