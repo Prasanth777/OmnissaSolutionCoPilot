@@ -150,6 +150,13 @@ ATTRIBUTE_OVERRIDES: list[tuple[str, str, dict]] = [
         "external connection with blast network ports",
         {"dmz_design": "single"},
     ),
+    # Mis-tagged as access_external; it is the canonical Connection Server
+    # load-balancing view (internal path), so give it its own topic slot.
+    (
+        "resource/horizon-8-architecture",
+        "options for load balancing connection servers",
+        {"topic": "cs_load_balancing"},
+    ),
     (
         "resource/horizon-8-architecture",
         "external connection with blast network ports",
@@ -224,6 +231,12 @@ def requirement_profile(answers: dict, selected_products=None) -> dict:
     )
     sites = "multi" if is_multi else "single" if is_single else ""
 
+    ha_model = (
+        "active_active" if ("active/active" in avail_raw or "active-active" in avail_raw or "active active" in avail_raw)
+        else "active_passive" if ("active/passive" in avail_raw or "active-passive" in avail_raw or "active passive" in avail_raw)
+        else ""
+    )
+
     dmz_raw = a.get("horizon_dmz_design", "")
     dmz = (
         "double" if "double" in dmz_raw
@@ -281,7 +294,7 @@ def requirement_profile(answers: dict, selected_products=None) -> dict:
     operations_detail = bool(a.get("monitoring_logging", "").replace("unknown / to be confirmed", "").strip())
 
     return {
-        "access": access, "sites": sites, "dmz": dmz, "lb": lb, "on_prem": on_prem,
+        "access": access, "sites": sites, "ha_model": ha_model, "dmz": dmz, "lb": lb, "on_prem": on_prem,
         "cloud": cloud, "protocols_allowed": protocols_allowed, "ws1_in_scope": ws1_in_scope,
         "av_in_scope": "app_volumes" in products,
         "dem_in_scope": "dynamic_environment_manager" in products,
@@ -304,6 +317,12 @@ def diagram_profile(row: dict) -> dict:
         sites = "multi"
     else:
         sites = ""
+
+    ha_model = (
+        "active_active" if "active_active" in site_topo
+        else "active_passive" if "active_passive" in site_topo
+        else ""
+    )
 
     protocols = set(row.get("protocols_visible") or row.get("protocols") or [])
     if "all display protocol" in text:
@@ -356,6 +375,7 @@ def diagram_profile(row: dict) -> dict:
     return {
         "access": row.get("access_scope", "") or "",
         "sites": sites,
+        "ha_model": ha_model,
         "dmz": dmz,
         "platform": _infer_platform(text, page),
         "hzc_gen": hzc_gen,
@@ -395,6 +415,15 @@ RULES: list[Rule] = [
             or (req["sites"] == "multi" and dia["sites"] == "single")
             or (req["sites"] == "single" and any(k in dia["text"] for k in SINGLE_SITE_EXCLUDED_KEYWORDS))
         ),
+    ),
+    Rule(
+        "availability_model",
+        # Active/active answers must not get active/passive diagrams and vice versa.
+        conflict=lambda req, dia: (
+            bool(req.get("ha_model")) and bool(dia.get("ha_model"))
+            and dia["ha_model"] != req["ha_model"]
+        ),
+        bonus=lambda req, dia: 15 if req.get("ha_model") and dia.get("ha_model") == req.get("ha_model") else 0,
     ),
     Rule(
         "dmz",
@@ -485,7 +514,15 @@ RULES: list[Rule] = [
     ),
     Rule(
         "generic_network_connection",
-        conflict=lambda req, dia: any(k in dia["text"] for k in GENERIC_CONNECTION_KEYWORDS) and "blast" not in dia["text"],
+        # Block generic connection-flow figures, but never load-balancing or
+        # component architecture diagrams whose captions merely mention
+        # "internal/external connections".
+        conflict=lambda req, dia: (
+            any(k in dia["text"] for k in GENERIC_CONNECTION_KEYWORDS)
+            and "blast" not in dia["text"]
+            and not dia.get("lb_target")
+            and "load balanc" not in dia["text"]
+        ),
     ),
     Rule(
         "workspace_one",
@@ -534,6 +571,113 @@ def conflicting_rules(row: dict, answers: dict, selected_products=None) -> list[
     return [rule.name for rule in RULES if rule.conflict(req, dia)]
 
 
+RULE_EXPLANATIONS = {
+    "access": "its access model (internal/external) does not match the interview answers",
+    "sites": "its site topology (single vs multi-site) conflicts with the answers",
+    "availability_model": "it shows the opposite availability model (active/active vs active/passive)",
+    "dmz": "its DMZ layout conflicts with the selected DMZ design",
+    "lb_placement": "its load-balancer placement conflicts with the selected placement",
+    "component_scope": "it shows products that are not in the selected scope",
+    "horizon_platform": "it belongs to the other Horizon platform (Horizon 8 vs Horizon Cloud)",
+    "hzc_generation": "it shows the other Horizon Cloud generation (first-gen vs next-gen)",
+    "hzc_provider": "it shows a different cloud provider than the one selected",
+    "cloud": "it targets a different cloud platform than this design",
+    "protocols": "it shows display protocols outside the Blast-only scope",
+    "blast_only": "it depicts non-Blast display protocols (PCoIP/RDP)",
+    "generic_network_connection": "it is a generic connection-flow figure rather than a design diagram",
+    "workspace_one": "it shows Workspace ONE components that are not in scope",
+    "content_type": "it is methodology or process content, not deliverable architecture",
+    "app_volumes_scope": "App Volumes is not in the selected scope",
+    "dem_scope": "Dynamic Environment Manager is not in the selected scope",
+    "fslogix_scope": "FSLogix is not part of the selected profile strategy",
+    "process_or_screenshot_scope": "it is an operational screenshot or process view",
+    "on_prem_hybrid_capacity": "it shows hybrid/cloud-bursting patterns that conflict with on-premises hosting",
+    "feedback_blocked": "previous reviewer feedback marked this diagram as wrong for similar designs",
+}
+
+
+def explain_figure_selection(
+    row: dict,
+    answers: dict,
+    selected_products: list,
+    reference_urls: list,
+    shown_rows: list,
+    data_dir=None,
+) -> str:
+    """Human-readable rationale for why a diagram is or is not in the output."""
+    req = requirement_profile(answers, selected_products)
+    dia = diagram_profile(row)
+    ref_set = {_canon(u) for u in (reference_urls or [])}
+    caption = row.get("caption") or row.get("title") or "This diagram"
+    page = str(row.get("page_url", ""))
+    tags = figure_attribute_tags(row)
+
+    shown_keys = set()
+    for shown in shown_rows or []:
+        md5, ahash = image_content_keys(str(shown.get("local_path", "")))
+        shown_keys.update(k for k in (md5, ahash, str(shown.get("local_path", ""))) if k)
+    md5, ahash = image_content_keys(str(row.get("local_path", "")))
+    is_shown = bool({md5, ahash, str(row.get("local_path", ""))} & shown_keys)
+
+    lines = [f"**{caption}**  \nSource: {page}"]
+    if tags:
+        lines.append("Detected attributes: " + " · ".join(tags))
+
+    feedback_note = ""
+    if data_dir:
+        try:
+            from .feedback import caption_key, figure_adjustments
+
+            adjustments, blocked = figure_adjustments(data_dir, req)
+            row_keys = [k for k in (md5, ahash, caption_key(row)) if k]
+            if any(k in blocked for k in row_keys):
+                feedback_note = "blocked"
+            else:
+                delta = next((adjustments[k] for k in row_keys if k in adjustments), 0.0)
+                if delta:
+                    feedback_note = f"{delta:+.0f}"
+        except Exception:
+            feedback_note = ""
+
+    violated = [rule.name for rule in RULES if rule.conflict(req, dia)]
+    if feedback_note == "blocked" and not is_shown:
+        lines.append(
+            "**Status: excluded by learned reviewer feedback.** This diagram received repeated thumbs-down "
+            "feedback for similar designs, so the selector now skips it. If that is wrong, remove the relevant "
+            "entries from data/feedback.jsonl or give the diagram a thumbs-up in a future output."
+        )
+        return "\n\n".join(lines)
+    if feedback_note and feedback_note != "blocked":
+        lines.append(f"Learned feedback adjustment applied to its relevance score: {feedback_note}.")
+    if is_shown:
+        lines.append("**Status: included in the current HLD.**")
+        matches = []
+        if req.get("sites") and dia.get("sites") == req.get("sites"):
+            matches.append(f"site topology ({req['sites']}-site)")
+        if req.get("ha_model") and dia.get("ha_model") == req.get("ha_model"):
+            matches.append("availability model")
+        if req.get("dmz") and dia.get("dmz") == req.get("dmz"):
+            matches.append(f"{req['dmz']} DMZ design")
+        if req.get("lb") and dia.get("lb_target"):
+            matches.append("load-balancer placement")
+        if matches:
+            lines.append("It matches your answers on: " + ", ".join(matches) + ".")
+    elif violated:
+        reasons = [RULE_EXPLANATIONS.get(name, name) for name in violated]
+        lines.append("**Status: excluded.** It conflicts with the design answers because " + "; ".join(reasons) + ".")
+        lines.append("If this exclusion is wrong, adjust the related answer (e.g. via chat: 'switch to double DMZ') or use the diagram review panel to include it manually.")
+    elif not _relevant(row, ref_set):
+        lines.append("**Status: not considered.** Its source page is not part of the reference set for the selected products, so it never entered the candidate pool.")
+    else:
+        score = _score(row, dia, ref_set, req)
+        lines.append(
+            f"**Status: eligible but outranked.** It passed every design rule (relevance score {score}) "
+            "but other diagrams on the same topic scored higher for your answers, and the diagram limit was reached. "
+            "Raise 'Max architecture diagrams' in the sidebar or ask me to 'add' it explicitly."
+        )
+    return "\n\n".join(lines)
+
+
 def figure_attribute_tags(row: dict) -> list[str]:
     """Short human-readable attribute tags for the diagram review UI."""
     dia = diagram_profile(row)
@@ -542,6 +686,8 @@ def figure_attribute_tags(row: dict) -> list[str]:
         tags.append("Horizon Cloud" if dia["platform"] == "horizon_cloud" else "Horizon 8")
     if dia.get("sites"):
         tags.append("Multi-site" if dia["sites"] == "multi" else "Single-site")
+    if dia.get("ha_model"):
+        tags.append("Active/Active" if dia["ha_model"] == "active_active" else "Active/Passive")
     if dia.get("dmz") not in ("", "none"):
         tags.append(f"{dia['dmz'].title()} DMZ")
     if dia.get("uag"):
@@ -619,14 +765,21 @@ def image_content_keys(local_path: str) -> tuple[str, str]:
     cached = _CONTENT_KEY_CACHE.get(local_path)
     if cached is not None:
         return cached
-    try:
-        import hashlib
+    import hashlib
+    import time as _time
 
-        data = Path(local_path).read_bytes()
-        md5 = hashlib.md5(data).hexdigest()
-    except Exception:
-        _CONTENT_KEY_CACHE[local_path] = ("", "")
+    data = None
+    for _attempt in range(3):
+        try:
+            data = Path(local_path).read_bytes()
+            break
+        except Exception:
+            _time.sleep(0.1)
+    if data is None:
+        # Do NOT cache failures: a transient read error must not permanently
+        # poison duplicate detection or feedback identity for this image.
         return ("", "")
+    md5 = hashlib.md5(data).hexdigest()
     ahash = ""
     try:
         from PIL import Image
@@ -660,7 +813,9 @@ def _load_arch_rows(store) -> list:
             continue
         lp = str(r.get("local_path", ""))
         if lp and Path(lp).exists():
-            rows.append(r)
+            # Apply manual metadata corrections up front so topic grouping and
+            # profiling all see the corrected attributes.
+            rows.append(apply_attribute_overrides(r))
     return rows
 
 def select_hld_images(store, selected_products, answers, reference_urls, limit: int = 10) -> list:
@@ -681,6 +836,18 @@ def select_hld_images(store, selected_products, answers, reference_urls, limit: 
 
     req = requirement_profile(answers, selected_products)
 
+    # Learned reinforcement from reviewer feedback (thumbs up/down history).
+    adjustments: dict[str, float] = {}
+    blocked_keys: set[str] = set()
+    try:
+        from .feedback import figure_adjustments
+
+        data_dir = getattr(getattr(store, "settings", None), "data_dir", None)
+        if data_dir:
+            adjustments, blocked_keys = figure_adjustments(data_dir, req)
+    except Exception:
+        adjustments, blocked_keys = {}, set()
+
     scored: list[tuple[int, dict, dict]] = []
     excluded_by_rule: dict[str, int] = {}
     for r in rows:
@@ -692,7 +859,21 @@ def select_hld_images(store, selected_products, answers, reference_urls, limit: 
             for name in violated:
                 excluded_by_rule[name] = excluded_by_rule.get(name, 0) + 1
             continue
-        scored.append((_score(r, dia, ref_set, req), r, dia))
+        lp = str(r.get("local_path", ""))
+        feedback_delta = 0.0
+        if adjustments or blocked_keys:
+            from .feedback import caption_key
+
+            md5, ahash = image_content_keys(lp)
+            row_keys = [k for k in (md5, ahash, caption_key(r)) if k]
+            if any(k in blocked_keys for k in row_keys):
+                excluded_by_rule["feedback_blocked"] = excluded_by_rule.get("feedback_blocked", 0) + 1
+                continue
+            for k in row_keys:
+                if k in adjustments:
+                    feedback_delta = adjustments[k]
+                    break
+        scored.append((_score(r, dia, ref_set, req) + int(feedback_delta), r, dia))
 
     if logger:
         req_summary = {k: v for k, v in req.items() if v not in ("", False, set(), None)}

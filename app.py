@@ -53,13 +53,30 @@ def bootstrap_state() -> None:
     st.session_state.setdefault("optional_questions_done", False)
     st.session_state.setdefault("figure_candidates", [])
     st.session_state.setdefault("figure_excluded", [])
+    st.session_state.setdefault("custom_sections", [])
+    st.session_state.setdefault("excluded_sections", [])
+    st.session_state.setdefault("feedback_mode", "")
+    st.session_state.setdefault("fragment_chat_pending", False)
+    st.session_state.setdefault("fragment_chat_value", None)
+    st.session_state.setdefault("fragment_chat_action", {})
+    st.session_state.setdefault("add_diagram_match_notice", {})
     st.session_state.setdefault("use_sample_template", True)
     st.session_state.setdefault("sample_template_path", "/Users/prasanththangaraj/Downloads/test-for AI.pptx")
     st.session_state.setdefault("_visible_questions_cache", {"signature": "", "questions": []})
 
 
-def chat_add(role: str, content: str) -> None:
-    st.session_state.messages.append({"role": role, "content": content})
+def chat_add(
+    role: str,
+    content: str,
+    details: list[str] | None = None,
+    action: dict[str, str] | None = None,
+) -> None:
+    message: dict[str, object] = {"role": role, "content": content}
+    if details:
+        message["details"] = list(details)
+    if action:
+        message["action"] = dict(action)
+    st.session_state.messages.append(message)
 
 
 def first_question():
@@ -117,6 +134,8 @@ def reset_optional_questions_state() -> None:
     st.session_state.optional_questions_done = False
     st.session_state.figure_candidates = []
     st.session_state.figure_excluded = []
+    st.session_state.custom_sections = []
+    st.session_state.excluded_sections = []
 
 
 def compute_figure_candidates() -> list[dict]:
@@ -135,7 +154,7 @@ def compute_figure_candidates() -> list[dict]:
         selected_products=product_keys,
         answers=answers,
         reference_urls=list(dict.fromkeys(refs)),
-        limit=10,
+        limit=int(st.session_state.get("figure_limit", 10)),
     )
 
 
@@ -201,6 +220,21 @@ def focus_chat_input() -> None:
     """
     if hasattr(st, "html"):
         st.html(js)
+
+
+def queue_fragment_question() -> None:
+    """Capture the submitted chat value before rerunning only the fragment."""
+    value = st.session_state.get("post_question")
+    if not value or st.session_state.get("fragment_chat_pending"):
+        return
+    st.session_state.fragment_chat_value = value
+    st.session_state.fragment_chat_pending = True
+    text = getattr(value, "text", None)
+    if text is None:
+        text = str(value or "")
+    files = list(getattr(value, "files", []) or [])
+    display_text = text or ("(attached a diagram image)" if files else "")
+    chat_add("user", display_text)
 
 
 def initialize_agents():
@@ -383,6 +417,33 @@ def clean_markdown_text(text: str, max_len: int = 1200) -> str:
     cleaned = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned[:max_len]
+
+
+def _record_generation_time(seconds: float) -> None:
+    """Persist actual generation durations so future estimates are accurate."""
+    path = ROOT / "data" / "generation_times.json"
+    try:
+        history = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+    except Exception:
+        history = []
+    history = (list(history) + [round(float(seconds), 1)])[-10:]
+    try:
+        path.write_text(json.dumps(history), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def estimated_generation_seconds() -> int:
+    """Estimate from the average of recent actual runs; fall back to the model."""
+    path = ROOT / "data" / "generation_times.json"
+    try:
+        history = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+    except Exception:
+        history = []
+    recent = [float(v) for v in history[-5:] if isinstance(v, (int, float))]
+    if recent:
+        return max(30, int(sum(recent) / len(recent)))
+    return estimate_ppt_generation_seconds()
 
 
 def estimate_ppt_generation_seconds() -> int:
@@ -646,33 +707,347 @@ def selected_image_identifiers(image_rows: list[dict]) -> list[dict[str, str]]:
     return identifiers
 
 
-def generate_hld_outputs(orchestrator, rag_store):
+HLD_INSTRUCTION = (
+    "Use Omnissa Tech Zone context from the RAG results only. Write for a formal high-level design document. "
+    "Ground each recommendation in the retrieved architecture guidance. If a customer detail is unknown or to be confirmed, "
+    "state it as an assumption or open item rather than inventing a value."
+)
+
+
+def _section_prompt(section: str, context_blob: str, product_keys: list[str]) -> str:
+    """Grounded generation prompt for a named HLD section (shared by full
+    generation and conversational rewrites)."""
+    if section == "summary":
+        return f"{HLD_INSTRUCTION}\nCreate a customer-facing executive summary based on these inputs:\n{context_blob}"
+    if section == "architecture":
+        return f"{HLD_INSTRUCTION}\nProvide a high-level architecture description for selected products {', '.join(product_keys)} and customer inputs:\n{context_blob}"
+    if section == "security":
+        return f"{HLD_INSTRUCTION}\nDescribe security standards, access design, RBAC, certificates, hardening, and logging for these customer constraints:\n{context_blob}"
+    if section == "networking":
+        return f"{HLD_INSTRUCTION}\nDescribe the networking requirements for this design: network segments/subnets, required ports and firewall rules, load balancing, DNS/DHCP/NTP dependencies, and external access paths, for these customer constraints:\n{context_blob}"
+    if section == "operations":
+        return f"{HLD_INSTRUCTION}\nDescribe operational model, HA, backup, monitoring, and DR for these customer constraints:\n{context_blob}"
+    if section in PRODUCTS:
+        return f"{HLD_INSTRUCTION}\nProvide customer-facing HLD detailed design guidance for {PRODUCTS[section].title} using these inputs:\n{context_blob}"
+    return f"{HLD_INSTRUCTION}\nProvide customer-facing HLD design guidance about {section.replace('_', ' ')} using these inputs:\n{context_blob}"
+
+
+def apply_hld_edit(cmd: dict, orchestrator, rag_store) -> str:
+    """Execute a conversational HLD edit and rebuild the outputs. Returns a chat message."""
+    from sa_hld_bot.hld_followup import section_display_name
+
+    action = cmd.get("action", "qa")
+    answers = effective_answers(st.session_state.answers)
+    context_blob = "\n".join(f"{k}: {v}" for k, v in answers.items())
+    product_keys = st.session_state.selected_products
+    titles = {k: PRODUCTS[k].title for k in product_keys if k in PRODUCTS}
+
+    if action == "update_answer":
+        key, value = cmd["answer_key"], cmd["answer_value"]
+        if not value:
+            return "Tell me the new value, for example: 'change the DMZ design to Double DMZ'."
+        st.session_state.answers[key] = value
+        clear_question_cache()
+        from sa_hld_bot.image_select import select_hld_images
+        st.session_state.ppt_preview_images = select_hld_images(
+            rag_store, product_keys, effective_answers(st.session_state.answers),
+            st.session_state.get("last_references", []),
+            limit=int(st.session_state.get("figure_limit", 10)),
+        )
+        rebuild_deck_from_state()
+        return (
+            f"Updated **{key.replace('_', ' ')}** to '{value}', re-selected the matching Tech Zone diagrams, "
+            "and rebuilt the HLD. Ask me to 'rewrite' any section if its narrative should reflect this change too."
+        )
+
+    if action == "rewrite_section":
+        section = cmd["section"]
+        prompt = (
+            f"{_section_prompt(section, context_blob, product_keys)}\n\n"
+            f"Revision request from the architect: {cmd['instruction']}\n"
+            "Rewrite the section accordingly, staying grounded in the Tech Zone context."
+        )
+        result = orchestrator.answer(prompt)
+        if result.blocked:
+            return f"Blocked by guardrail: {result.blocked_reason}"
+        narrative = dict(st.session_state.get("rag_narrative") or {})
+        narrative[section] = clean_markdown_text(result.answer, max_len=2400)
+        st.session_state.rag_narrative = narrative
+        st.session_state.excluded_sections = [s for s in st.session_state.get("excluded_sections", []) if s != section]
+        rebuild_deck_from_state()
+        refs = "\n".join(f"- {u}" for u in (result.citations or [])[:5])
+        return f"Rewrote the **{section_display_name(section, titles)}** section and rebuilt the HLD.\n\nSources:\n{refs}"
+
+    if action == "add_section":
+        prompt = (
+            f"{HLD_INSTRUCTION}\nWrite a customer-facing HLD section titled '{cmd['title']}' covering: "
+            f"{cmd['instruction']}\nCustomer inputs:\n{context_blob}"
+        )
+        result = orchestrator.answer(prompt)
+        if result.blocked:
+            return f"Blocked by guardrail: {result.blocked_reason}"
+        sections = [s for s in st.session_state.get("custom_sections", [])
+                    if s.get("title", "").lower() != cmd["title"].lower()]
+        sections.append({
+            "title": cmd["title"],
+            "content": clean_markdown_text(result.answer, max_len=2400),
+            "keywords": cmd.get("keywords", []),
+        })
+        st.session_state.custom_sections = sections
+        rebuild_deck_from_state()
+        refs = "\n".join(f"- {u}" for u in (result.citations or [])[:5])
+        return f"Added the section **{cmd['title']}** (grounded in Tech Zone) and rebuilt the HLD.\n\nSources:\n{refs}"
+
+    if action == "remove_section":
+        section = cmd["section"]
+        custom = st.session_state.get("custom_sections", [])
+        remaining = [s for s in custom if _slugify(s.get("title", "")) != section]
+        if len(remaining) != len(custom):
+            st.session_state.custom_sections = remaining
+        else:
+            excluded = set(st.session_state.get("excluded_sections", []))
+            excluded.add(section)
+            st.session_state.excluded_sections = sorted(excluded)
+        rebuild_deck_from_state()
+        return f"Removed the **{section_display_name(section, titles)}** section and rebuilt the HLD."
+
+    if action == "regenerate_all":
+        output_path, docx_path, refs, _preview = generate_hld_outputs(orchestrator, rag_store)
+        return f"Regenerated the full HLD: `{output_path}` and `{docx_path}`"
+
+    return ""
+
+
+def _slugify(title: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(title).lower()).strip("_")
+
+
+def _app_log():
+    from sa_hld_bot.logging_utils import get_logger
+
+    return get_logger("sa_hld_bot.app", ROOT / "data" / "logs")
+
+
+def _caption_rows_local() -> list[dict]:
+    """Caption store rows read directly from disk (no RAG store required)."""
+    path = ROOT / "data" / "image_captions.jsonl"
+    if not path.exists():
+        return []
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except Exception:
+            continue
+    return rows
+
+
+_WHY_STOPWORDS = {"diagram", "image", "figure", "picture", "shown", "included", "selected", "output", "why", "wasnt", "isnt", "this", "that", "the", "not", "was"}
+
+
+def _find_row_by_keywords(text: str) -> dict | None:
+    """Best caption-store match for a free-text diagram description."""
+    normalized = str(text).lower()
+    words = list(dict.fromkeys(
+        w for w in re.findall(r"[a-z0-9-]+", normalized)
+        if len(w) > 3 and w not in _WHY_STOPWORDS
+    ))
+    if not words:
+        return None
+    desired_ha = (
+        "active_active" if re.search(r"active[\s/-]+active", normalized)
+        else "active_passive" if re.search(r"active[\s/-]+passive", normalized)
+        else ""
+    )
+    best, best_hits = None, 0
+    for row in _caption_rows_local():
+        haystack = " ".join([
+            str(row.get("caption", "")), str(row.get("topic", "")),
+            str(row.get("section_heading", "")), str(row.get("page_url", "")),
+        ]).lower()
+        hits = sum(1 for w in words if w in haystack)
+        if desired_ha:
+            from sa_hld_bot.image_select import diagram_profile
+            if diagram_profile(row).get("ha_model") == desired_ha:
+                hits += 3
+        if hits > best_hits:
+            best, best_hits = row, hits
+    return best if best_hits >= 2 else None
+
+
+def _direct_design_conflict_explanation(text: str, answers: dict[str, str]) -> str:
+    """Answer clear availability-model conflicts from verified interview inputs."""
+    normalized = str(text).lower()
+    requested = (
+        "active_active" if re.search(r"active[\s/-]+active", normalized)
+        else "active_passive" if re.search(r"active[\s/-]+passive", normalized)
+        else ""
+    )
+    availability = normalize_answer(answers.get("availability_requirements"))
+    selected_text = availability.lower()
+    selected = (
+        "active_active" if re.search(r"active[\s/-]+active", selected_text)
+        else "active_passive" if re.search(r"active[\s/-]+passive", selected_text)
+        else ""
+    )
+    if not requested or not selected or requested == selected:
+        return ""
+
+    requested_label = "active-active" if requested == "active_active" else "active-passive"
+    selected_label = "active-active" if selected == "active_active" else "active-passive"
+    site = normalize_answer(answers.get("site_topology"))
+    site_clause = f" and the site topology is **{site}**" if site else ""
+    return (
+        f"The **{requested_label}** diagram was not selected because your design input is "
+        f"**{availability or selected_label}**{site_clause}. The selector excludes diagrams that show the "
+        f"opposite availability model, so it correctly favored {selected_label} multi-site views. "
+        f"If the intended architecture is {requested_label}, change the availability requirement to "
+        f"**Multi-site {requested_label.replace('-', '/')}** and regenerate the diagram set."
+    )
+
+
+def _looks_like_why_question(text: str) -> bool:
+    from sa_hld_bot.diagram_qa import looks_like_diagram_selection_question
+
+    return looks_like_diagram_selection_question(text)
+
+
+def enable_clipboard_paste_bridge() -> None:
+    """Let users paste images from the clipboard (Ctrl/Cmd+V) anywhere on the page.
+
+    The pasted image is forwarded as a synthetic drop event to the nearest
+    visible dropzone: a file uploader if one is open (e.g. the Add-a-diagram
+    popover), otherwise the chat input's attachment zone.
+    """
+    js = """
+    <script>
+    (function() {
+      const P = window.parent;
+      if (P.__hldPasteBridgeV1) return;
+      P.__hldPasteBridgeV1 = true;
+      P.document.addEventListener('paste', function(ev) {
+        try {
+          const items = (ev.clipboardData || {}).items || [];
+          let file = null;
+          for (const it of items) {
+            if (it.kind === 'file' && it.type && it.type.indexOf('image/') === 0) {
+              file = it.getAsFile();
+              break;
+            }
+          }
+          if (!file) return;
+          const zones = Array.from(P.document.querySelectorAll(
+            '[data-testid="stFileUploaderDropzone"], [data-testid="stChatInputFileUploadButton"]'
+          )).filter(el => el.offsetParent !== null);
+          if (!zones.length) return;
+          const uploader = zones.find(el => el.getAttribute('data-testid') === 'stFileUploaderDropzone');
+          const target = uploader || zones[0];
+          const named = new File([file], 'pasted-' + Date.now() + '.png', {type: file.type || 'image/png'});
+          const dt = new DataTransfer();
+          dt.items.add(named);
+          const event = new Event('drop', {bubbles: true, cancelable: true});
+          event.dataTransfer = dt;
+          target.dispatchEvent(event);
+          ev.preventDefault();
+        } catch (e) {}
+      }, true);
+    })();
+    </script>
+    """
+    try:
+        # st.html strips <script> tags unless JavaScript is explicitly allowed.
+        st.html(js, unsafe_allow_javascript=True)
+    except TypeError:
+        # Older Streamlit: fall back to an iframe component, which executes JS.
+        import streamlit.components.v1 as components
+
+        components.html(js, height=0)
+
+
+def record_figure_feedback(vote: str, row: dict, reason: str = "") -> None:
+    """Persist per-diagram thumbs feedback from the curation panel."""
+    from sa_hld_bot.feedback import figure_keys_for_rows, record_feedback
+    from sa_hld_bot.image_select import requirement_profile
+
+    req = requirement_profile(effective_answers(st.session_state.answers), st.session_state.selected_products)
+    record_feedback(
+        ROOT / "data", vote, req, st.session_state.selected_products,
+        reason=reason, figure_keys=figure_keys_for_rows([row]), kind="figure",
+        session_id=st.session_state.get("current_session_id", ""),
+    )
+
+
+def record_hld_feedback(vote: str, reason: str = "", uploaded: bytes | None = None) -> str:
+    """Persist a thumbs up/down and return an extra note for the UI message."""
+    from sa_hld_bot.feedback import figure_keys_for_rows, match_uploaded_image, record_feedback
+    from sa_hld_bot.image_select import requirement_profile
+
+    req = requirement_profile(effective_answers(st.session_state.answers), st.session_state.selected_products)
+    shown_rows = st.session_state.get("ppt_preview_images", [])
+    figure_keys: list[dict] = []
+    kind = "hld"
+    extra = ""
+    if vote == "up":
+        figure_keys = figure_keys_for_rows(shown_rows)
+    elif uploaded:
+        match = match_uploaded_image(_caption_rows_local(), uploaded)
+        if match is not None:
+            figure_keys = figure_keys_for_rows([match])
+            kind = "figure"
+            extra = f" Identified diagram: {match.get('caption', '')}."
+        else:
+            extra = " (The uploaded image didn't match a library diagram; the written reason was still recorded.)"
+    record_feedback(
+        ROOT / "data", vote, req, st.session_state.selected_products,
+        reason=reason, figure_keys=figure_keys, kind=kind,
+        session_id=st.session_state.get("current_session_id", ""),
+    )
+    return extra
+
+
+def generate_hld_outputs(orchestrator, rag_store, progress=None):
     from sa_hld_bot.ppt_builder import HldPptBuilder
     from sa_hld_bot.docx_builder import HldDocxBuilder
+
+    def report(message: str) -> None:
+        if progress:
+            try:
+                progress(message)
+            except Exception:
+                pass
+
     answers = effective_answers(st.session_state.answers)
     product_keys = st.session_state.selected_products
     product_objs = [PRODUCTS[key] for key in product_keys if key in PRODUCTS]
+    report("Preparing the Tech Zone reference set")
     resources = compile_reference_resources(product_keys)
 
     context_blob = "\n".join(f"{k}: {v}" for k, v in answers.items())
-    hld_instruction = (
-        "Use Omnissa Tech Zone context from the RAG results only. Write for a formal high-level design document. "
-        "Ground each recommendation in the retrieved architecture guidance. If a customer detail is unknown or to be confirmed, "
-        "state it as an assumption or open item rather than inventing a value."
-    )
-    prompts = {
-        "summary": f"{hld_instruction}\nCreate a customer-facing executive summary based on these inputs:\n{context_blob}",
-        "architecture": f"{hld_instruction}\nProvide a high-level architecture description for selected products {', '.join(product_keys)} and customer inputs:\n{context_blob}",
-        "security": f"{hld_instruction}\nDescribe security standards, access design, RBAC, certificates, hardening, and logging for these customer constraints:\n{context_blob}",
-        "networking": f"{hld_instruction}\nDescribe the networking requirements for this design: network segments/subnets, required ports and firewall rules, load balancing, DNS/DHCP/NTP dependencies, and external access paths, for these customer constraints:\n{context_blob}",
-        "operations": f"{hld_instruction}\nDescribe operational model, HA, backup, monitoring, and DR for these customer constraints:\n{context_blob}",
-    }
-    for key in product_keys:
-        prompts[key] = f"{hld_instruction}\nProvide customer-facing HLD detailed design guidance for {PRODUCTS[key].title} using these inputs:\n{context_blob}"
+    prompts = {key: _section_prompt(key, context_blob, product_keys) for key in
+               ["summary", "architecture", "security", "networking", "operations", *product_keys]}
+
+    # Replay reviewer feedback (thumbs-down reasons from similar designs) into
+    # the generation prompts so past complaints are addressed automatically.
+    try:
+        from sa_hld_bot.feedback import narrative_guidance
+        from sa_hld_bot.image_select import requirement_profile
+        guidance = narrative_guidance(ROOT / "data", requirement_profile(answers, product_keys))
+    except Exception:
+        guidance = []
+    if guidance:
+        report(f"Applying {len(guidance)} learned reviewer feedback note(s)")
+        guidance_text = "\nPrevious reviewer feedback on similar designs — address it in this document:\n" + "\n".join(f"- {g}" for g in guidance)
+        prompts = {key: value + guidance_text for key, value in prompts.items()}
 
     narrative: dict[str, str] = {}
     all_citations: list[str] = []
+    section_names = {"summary": "Executive summary", "architecture": "Solution overview", "security": "Security standards", "networking": "Networking requirements", "operations": "Operations and recovery"}
     for section, prompt in prompts.items():
+        display = section_names.get(section, PRODUCTS[section].title if section in PRODUCTS else section)
+        report(f"Writing section: {display}")
         result = orchestrator.answer(prompt)
         if result.blocked:
             narrative[section] = f"RAG guardrail block: {result.blocked_reason}"
@@ -680,22 +1055,25 @@ def generate_hld_outputs(orchestrator, rag_store):
             narrative[section] = clean_markdown_text(result.answer, max_len=1500)
         all_citations.extend(result.citations)
 
+    report("Compiling document references")
     citation_refs = [resources_url for resources_url in all_citations if resources_url]
     derived_refs = derive_solution_references(product_keys, answers)
     base_refs = [resource.url for resource in resources]
     candidate_references = filter_solution_references(product_keys, answers, list(dict.fromkeys(base_refs + derived_refs + citation_refs)))
+    report("Selecting architecture diagrams matched to your answers")
     from sa_hld_bot.image_select import select_hld_images as select_hld_images_v3
     image_rows = select_hld_images_v3(
         rag_store,
         selected_products=product_keys,
         answers=answers,
         reference_urls=candidate_references,
-        limit=10,
+        limit=int(st.session_state.get("figure_limit", 10)),
     )
     # Respect any exclusions made in the diagram review panel.
     excluded_figures = set(st.session_state.get("figure_excluded", []))
     if excluded_figures:
         image_rows = [row for row in image_rows if str(row.get("local_path", "")) not in excluded_figures]
+    report(f"Matched {len(image_rows)} diagrams: " + "; ".join((r.get("caption") or "")[:60] for r in image_rows[:6]) + ("..." if len(image_rows) > 6 else ""))
     references = filter_solution_references(
         product_keys,
         answers,
@@ -707,6 +1085,7 @@ def generate_hld_outputs(orchestrator, rag_store):
     output_path = output_dir / f"{base_name}.pptx"
     docx_path = output_dir / f"{base_name}.docx"
 
+    report("Building the PowerPoint deck")
     builder = HldPptBuilder()
     sample_path_raw = str(st.session_state.get("sample_template_path", "")).strip()
     sample_path = Path(sample_path_raw) if sample_path_raw else None
@@ -725,6 +1104,7 @@ def generate_hld_outputs(orchestrator, rag_store):
     if "use_sample_style" in params:
         build_kwargs["use_sample_style"] = bool(st.session_state.get("use_sample_template", False))
     builder.build(**build_kwargs)
+    report("Building the Word document (cover, TOC, numbered sections, figures)")
     docx_builder = HldDocxBuilder()
     docx_builder.build(
         output_path=docx_path,
@@ -734,6 +1114,8 @@ def generate_hld_outputs(orchestrator, rag_store):
         rag_narrative=narrative,
         references=references,
         image_rows=image_rows,
+        custom_sections=st.session_state.get("custom_sections", []),
+        excluded_sections=set(st.session_state.get("excluded_sections", [])),
     )
     preview_sections = [
         {"title": "Customer Context", "content": "\n".join(builder._context_bullets(answers))},
@@ -751,6 +1133,7 @@ def generate_hld_outputs(orchestrator, rag_store):
     st.session_state.ppt_path = str(output_path)
     st.session_state.docx_path = str(docx_path)
     st.session_state.rag_narrative = narrative
+    report("Saving the session")
     persist_current_session()
     return output_path, docx_path, references, preview_sections
 
@@ -780,6 +1163,8 @@ def persist_current_session() -> str:
         "docx_path": st.session_state.get("docx_path", ""),
         "optional_questions_consent": st.session_state.get("optional_questions_consent", ""),
         "optional_questions_done": bool(st.session_state.get("optional_questions_done", False)),
+        "custom_sections": st.session_state.get("custom_sections", []),
+        "excluded_sections": st.session_state.get("excluded_sections", []),
     }
     sid = save_session(ROOT / "data", payload, session_id=payload["id"])
     st.session_state.current_session_id = sid
@@ -803,6 +1188,8 @@ def load_session_into_state(payload: dict) -> None:
     st.session_state.current_session_id = payload.get("id", "")
     st.session_state.optional_questions_consent = payload.get("optional_questions_consent", "")
     st.session_state.optional_questions_done = bool(payload.get("optional_questions_done", False))
+    st.session_state.custom_sections = payload.get("custom_sections", []) or []
+    st.session_state.excluded_sections = payload.get("excluded_sections", []) or []
     clear_question_cache()
     st.session_state.generated_signature = _generation_signature()
 
@@ -840,10 +1227,377 @@ def rebuild_deck_from_state() -> None:
         output_path=docx_path, customer_name=answers.get("customer_name", "Customer"),
         selected_products=product_objs, questionnaire=answers, rag_narrative=narrative,
         references=references, image_rows=image_rows,
+        custom_sections=st.session_state.get("custom_sections", []),
+        excluded_sections=set(st.session_state.get("excluded_sections", [])),
     )
     st.session_state.ppt_path = str(output_path)
     st.session_state.docx_path = str(docx_path)
     persist_current_session()
+
+
+def add_uploaded_diagram_from_rag(
+    uploaded_bytes: bytes,
+    mime_type: str,
+    progress=None,
+) -> dict[str, object]:
+    """Resolve a pasted image through the Tech Zone image RAG and add it."""
+    report = progress or (lambda _message: None)
+    report("Loading the Tech Zone diagram index")
+    _settings, rag_store_obj, _orchestrator = initialize_agents()
+    if not rag_store_obj:
+        return {"status": "unavailable", "message": "The Tech Zone RAG store is unavailable."}
+
+    from sa_hld_bot.feedback import caption_key, match_uploaded_image_in_rag
+
+    report("Extracting visible labels and topology from the pasted diagram")
+    match, evidence = match_uploaded_image_in_rag(
+        rag_store_obj,
+        uploaded_bytes,
+        mime_type=mime_type,
+        rows=rag_store_obj._load_caption_rows(),
+    )
+    if match is None:
+        reason = str(evidence.get("reason") or "No confident matching Tech Zone diagram was found.")
+        return {
+            "status": "not_found",
+            "message": reason,
+            "evidence": evidence,
+        }
+
+    report("Verifying the matched diagram against the current HLD")
+    shown_rows = list(st.session_state.get("ppt_preview_images", []))
+    existing = {caption_key(row) for row in shown_rows}
+    caption = str(match.get("caption") or match.get("title") or "Tech Zone diagram")
+    if caption_key(match) in existing:
+        return {
+            "status": "existing",
+            "message": f"'{caption}' is already in the HLD.",
+            "match": match,
+            "evidence": evidence,
+        }
+
+    report("Adding the verified Tech Zone diagram and rebuilding the HLD")
+    new_row = dict(match)
+    new_row["slide_title"] = new_row.get("caption") or new_row.get("title")
+    st.session_state.ppt_preview_images = shown_rows + [new_row]
+    rebuild_deck_from_state()
+    details = [
+        f"Match method: {evidence.get('method', 'RAG image search')}",
+        f"Match confidence: {evidence.get('confidence', 'unknown')}",
+        f"Tech Zone source: {new_row.get('page_url', '')}",
+    ]
+    if evidence.get("reason"):
+        details.append(f"Verification: {evidence['reason']}")
+    chat_add(
+        "assistant",
+        f"Matched the pasted image to **{caption}**, added the authoritative Tech Zone diagram, and rebuilt the HLD.",
+        details,
+    )
+    return {
+        "status": "added",
+        "message": f"Added: {caption}",
+        "match": new_row,
+        "evidence": evidence,
+    }
+
+
+def process_hld_chat_request(chat_value, progress) -> bool:
+    """Process one queued HLD chat request; return whether the whole app changed."""
+    user_q = getattr(chat_value, "text", None)
+    if user_q is None:
+        user_q = str(chat_value or "")
+    attached = list(getattr(chat_value, "files", []) or [])
+    log = _app_log()
+    started = time.time()
+    trace: list[str] = []
+
+    def note(message: str) -> None:
+        trace.append(message)
+        progress(message)
+        log.info("Chat step %d: %s", len(trace), message)
+
+    log.info("Chat request: %r | attachments=%d", (user_q or "")[:200], len(attached))
+    note("Understanding your question")
+    settings_obj, rag_store_obj, orchestrator_obj = initialize_agents()
+    if not rag_store_obj or not orchestrator_obj:
+        chat_add("assistant", "Azure AI Foundry and the Tech Zone design store are required.", trace)
+        return False
+
+    foundry = rag_store_obj.foundry
+    changed_hld = False
+    if attached:
+        from sa_hld_bot.feedback import caption_key, match_uploaded_image_in_rag
+
+        library = rag_store_obj._load_caption_rows()
+        note(f"Matching the attached image against {len(library)} indexed Tech Zone diagrams")
+        upload = attached[0]
+        match, match_evidence = match_uploaded_image_in_rag(
+            rag_store_obj,
+            upload.getvalue() if hasattr(upload, "getvalue") else upload.read(),
+            mime_type=str(getattr(upload, "type", "") or "image/png"),
+            rows=library,
+        )
+        text_lower = (user_q or "").lower()
+        wants_rationale = any(
+            word in text_lower for word in ("why", "rationale", "reason", "explain")
+        )
+        wants_add = not text_lower or any(
+            word in text_lower for word in ("add", "include", "insert")
+        )
+        if match is None:
+            reason = str(match_evidence.get("reason") or "No confident match was found.")
+            chat_add(
+                "assistant",
+                f"I couldn't confidently match that image to an indexed Tech Zone diagram. {reason}",
+                trace,
+            )
+        elif wants_add and not wants_rationale:
+            note("Adding the verified RAG match and rebuilding the HLD")
+            row = dict(match)
+            row["slide_title"] = row.get("caption") or row.get("title")
+            existing = {caption_key(item) for item in st.session_state.ppt_preview_images}
+            if caption_key(row) in existing:
+                chat_add("assistant", f"'{match.get('caption', '')}' is already in the HLD.", trace)
+            else:
+                st.session_state.ppt_preview_images = list(st.session_state.ppt_preview_images) + [row]
+                rebuild_deck_from_state()
+                trace.extend([
+                    f"Match method: {match_evidence.get('method', 'RAG image search')}",
+                    f"Match confidence: {match_evidence.get('confidence', 'unknown')}",
+                    f"Tech Zone source: {match.get('page_url', '')}",
+                ])
+                chat_add(
+                    "assistant",
+                    f"Matched the pasted image to **{match.get('caption', '')}**, added the authoritative Tech Zone diagram, and rebuilt the HLD.",
+                    trace,
+                )
+                changed_hld = True
+        elif not wants_rationale and any(word in text_lower for word in ("remove", "drop", "delete", "exclude")):
+            note("Removing the matched diagram and rebuilding the HLD")
+            from sa_hld_bot.image_select import image_content_keys
+
+            target = {
+                key for key in (*image_content_keys(str(match.get("local_path", ""))), caption_key(match)) if key
+            }
+            kept = []
+            for row in st.session_state.ppt_preview_images:
+                keys = {
+                    key for key in (*image_content_keys(str(row.get("local_path", ""))), caption_key(row)) if key
+                }
+                if keys & target:
+                    continue
+                kept.append(row)
+            removed = len(st.session_state.ppt_preview_images) - len(kept)
+            st.session_state.ppt_preview_images = kept
+            if removed:
+                rebuild_deck_from_state()
+                chat_add("assistant", f"Removed '{match.get('caption', '')}' and rebuilt the HLD.", trace)
+                changed_hld = True
+            else:
+                chat_add("assistant", "That diagram isn't currently in the HLD.", trace)
+        else:
+            note("Reading the relevant questionnaire decisions")
+            note("Replaying the diagram-selection rules")
+            from sa_hld_bot.hld_followup import conversational_rationale
+            from sa_hld_bot.image_select import explain_figure_selection
+
+            facts = explain_figure_selection(
+                match,
+                effective_answers(st.session_state.answers),
+                st.session_state.selected_products,
+                st.session_state.get("last_references", []),
+                st.session_state.get("ppt_preview_images", []),
+                data_dir=ROOT / "data",
+            )
+            note("Validating the explanation against the evidence")
+            chat_add("assistant", conversational_rationale(foundry, user_q, facts), trace)
+    elif _looks_like_why_question(user_q):
+        from sa_hld_bot.diagram_qa import answer_diagram_question
+
+        result = answer_diagram_question(
+            foundry=foundry,
+            question=user_q,
+            answers=effective_answers(st.session_state.answers),
+            selected_products=st.session_state.selected_products,
+            reference_urls=st.session_state.get("last_references", []),
+            shown_rows=st.session_state.get("ppt_preview_images", []),
+            candidate_rows=_caption_rows_local(),
+            progress=note,
+            understanding_reported=True,
+        )
+        chat_add("assistant", result.answer, result.evidence_steps, result.suggested_action)
+    else:
+        note("Interpreting whether this is a question or an HLD change")
+        command = parse_command(foundry, user_q) if looks_like_image_command(user_q) else {"action": "none"}
+        if command.get("action", "none") != "none":
+            note("Applying the diagram change and rebuilding the HLD")
+            new_rows, message = apply_command(
+                rag_store_obj,
+                command,
+                effective_answers(st.session_state.answers),
+                st.session_state.selected_products,
+                st.session_state.last_references,
+                st.session_state.ppt_preview_images,
+                limit=int(st.session_state.get("figure_limit", 10)),
+            )
+            st.session_state.ppt_preview_images = new_rows
+            rebuild_deck_from_state()
+            chat_add("assistant", message or "Updated the diagrams.", trace)
+            changed_hld = True
+        else:
+            from sa_hld_bot.hld_followup import looks_like_edit_command, parse_hld_command
+
+            hld_command = {"action": "qa"}
+            if looks_like_edit_command(user_q):
+                custom_slugs = [
+                    _slugify(section.get("title", ""))
+                    for section in st.session_state.get("custom_sections", [])
+                ]
+                hld_command = parse_hld_command(
+                    foundry,
+                    user_q,
+                    answer_keys=list(st.session_state.answers.keys()),
+                    product_keys=st.session_state.selected_products + custom_slugs,
+                )
+            if hld_command.get("action", "qa") != "qa":
+                note("Applying the requested change and rebuilding the HLD")
+                message = apply_hld_edit(hld_command, orchestrator_obj, rag_store_obj)
+                chat_add("assistant", message or "Done — HLD updated.", trace)
+                changed_hld = True
+            else:
+                note("Searching Tech Zone and writing a grounded answer")
+                answer = orchestrator_obj.answer(user_q)
+                if answer.blocked:
+                    chat_add("assistant", f"Blocked by guardrail: {answer.blocked_reason}", trace)
+                else:
+                    refs = "\n".join(f"- {source}" for source in answer.citations[:8])
+                    chat_add("assistant", f"{answer.answer}\n\nSources:\n{refs}", trace)
+
+    log.info("Chat request completed in %.1fs", time.time() - started)
+    return changed_hld
+
+
+@st.fragment
+def render_hld_chat_fragment() -> None:
+    """Render and process HLD chat without rerunning the document-review UI."""
+    st.markdown("#### Ask about or refine this HLD")
+    conversation = [message for message in st.session_state.messages[1:] if message.get("content")]
+    if conversation:
+        with st.container(height=min(560, 140 + 100 * min(len(conversation), 5)), border=True):
+            for index, message in enumerate(conversation[-14:]):
+                with st.chat_message(message.get("role", "assistant")):
+                    details = [str(item) for item in (message.get("details") or []) if str(item).strip()]
+                    if details and message.get("role") == "assistant":
+                        with st.expander("What I checked", expanded=False):
+                            for detail in details:
+                                st.markdown(f"- {detail}")
+                    st.markdown(str(message.get("content", "")))
+                    action = message.get("action") or {}
+                    if action.get("type") == "update_answer":
+                        if st.button(
+                            str(action.get("label") or "Apply this design change"),
+                            key=f"chat_action_{len(conversation) - 14 + index}_{action.get('answer_key', '')}",
+                            type="primary",
+                            disabled=bool(
+                                st.session_state.get("fragment_chat_pending")
+                                or st.session_state.get("fragment_chat_action")
+                            ),
+                        ):
+                            st.session_state.fragment_chat_action = dict(action)
+                            st.rerun(scope="fragment")
+
+    status_slot = st.empty()
+    input_slot = st.empty()
+    is_busy = bool(
+        st.session_state.get("fragment_chat_pending")
+        or st.session_state.get("fragment_chat_action")
+    )
+    with input_slot:
+        st.chat_input(
+            "e.g. 'remove the DMZ image', 'switch to double DMZ', 'expand the networking section', "
+            "'why wasn't the active-active diagram shown?' — or attach a diagram image",
+            key="post_question",
+            accept_file=True,
+            file_type=["png", "jpg", "jpeg"],
+            disabled=is_busy,
+            on_submit=queue_fragment_question,
+        )
+
+    if not is_busy:
+        return
+
+    with status_slot.container():
+        with st.status("Thinking — starting", expanded=True, state="running") as status:
+            current = {"slot": None, "message": ""}
+
+            def progress(message: str) -> None:
+                if current["slot"] is not None:
+                    current["slot"].markdown(f"✅ {current['message']}")
+                current["message"] = message
+                current["slot"] = st.empty()
+                with current["slot"].container():
+                    st.spinner(message)
+                status.update(label=f"Thinking — {message}", expanded=True, state="running")
+
+            try:
+                action = dict(st.session_state.get("fragment_chat_action") or {})
+                if action:
+                    progress("Updating the questionnaire decision")
+                    key = str(action.get("answer_key", ""))
+                    value = str(action.get("answer_value", ""))
+                    if key not in {"availability_requirements", "horizon_dmz_design"} or not value:
+                        raise ValueError("Unsupported or incomplete chat action")
+                    st.session_state.answers[key] = value
+                    clear_question_cache()
+                    progress("Re-selecting diagrams from the updated design inputs")
+                    _settings, rag_store_obj, _orchestrator = initialize_agents()
+                    if not rag_store_obj:
+                        raise RuntimeError("Tech Zone design store is unavailable")
+                    from sa_hld_bot.image_select import select_hld_images
+
+                    st.session_state.ppt_preview_images = select_hld_images(
+                        rag_store_obj,
+                        st.session_state.selected_products,
+                        effective_answers(st.session_state.answers),
+                        st.session_state.get("last_references", []),
+                        limit=int(st.session_state.get("figure_limit", 10)),
+                    )
+                    progress("Rebuilding the HLD with the confirmed change")
+                    rebuild_deck_from_state()
+                    st.session_state.generated_signature = _generation_signature()
+                    field_label = key.replace("_", " ").title()
+                    trace = [
+                        f"Updated {field_label} to {value}",
+                        "Replayed diagram-selection rules",
+                        "Rebuilt the Word and PowerPoint outputs",
+                    ]
+                    chat_add(
+                        "assistant",
+                        f"Updated **{key.replace('_', ' ')}** to **{value}** and regenerated the diagram set and HLD.",
+                        trace,
+                    )
+                    st.session_state.fragment_chat_action = {}
+                    if current["slot"] is not None:
+                        current["slot"].markdown(f"✅ {current['message']}")
+                    status.update(label="HLD updated", state="complete", expanded=True)
+                    st.rerun(scope="app")
+                else:
+                    chat_value = st.session_state.get("fragment_chat_value")
+                    changed_hld = process_hld_chat_request(chat_value, progress)
+                    st.session_state.fragment_chat_pending = False
+                    st.session_state.fragment_chat_value = None
+                    if current["slot"] is not None:
+                        current["slot"].markdown(f"✅ {current['message']}")
+                    status.update(label="Answer ready", state="complete", expanded=True)
+                    st.rerun(scope="app" if changed_hld else "fragment")
+            except Exception as exc:
+                st.session_state.fragment_chat_pending = False
+                st.session_state.fragment_chat_value = None
+                st.session_state.fragment_chat_action = {}
+                if current["slot"] is not None:
+                    current["slot"].markdown(f"⚠️ {current['message']}")
+                chat_add("assistant", f"I couldn't complete that request: {exc}")
+                status.update(label="Request could not be completed", state="error", expanded=True)
 
 
 bootstrap_state()
@@ -905,6 +1659,24 @@ with st.sidebar:
         st.success("Azure AI Foundry configuration detected")
     else:
         st.error("Set Azure environment variables to enable agents and RAG")
+    _usage_path = ROOT / "data" / "llm_usage.jsonl"
+    if _usage_path.exists():
+        try:
+            _today = datetime.now().strftime("%Y-%m-%d")
+            _tok, _cost, _calls = 0, 0.0, 0
+            for _line in _usage_path.read_text(encoding="utf-8").splitlines():
+                try:
+                    _u = json.loads(_line)
+                except Exception:
+                    continue
+                if str(_u.get("ts", "")).startswith(_today):
+                    _tok += int(_u.get("prompt_tokens", 0)) + int(_u.get("completion_tokens", 0))
+                    _cost += float(_u.get("cost_usd", 0.0))
+                    _calls += 1
+            if _calls:
+                st.caption(f"LLM usage today: {_calls} calls · {_tok:,} tokens · ${_cost:,.4f}")
+        except Exception:
+            pass
     init_seconds = float(st.session_state.get("startup_init_seconds", 0.0))
     if init_seconds > 0:
         st.caption(f"Startup init time: {init_seconds:.2f}s")
@@ -981,6 +1753,15 @@ with st.sidebar:
                 st.info("No ingestion audit file yet.")
         else:
             st.caption("Click to load logs only when troubleshooting.")
+
+    st.subheader("Diagrams")
+    _fig_limit = st.slider(
+        "Max architecture diagrams",
+        min_value=5, max_value=20,
+        value=int(st.session_state.get("figure_limit", 10)),
+        help="Upper limit for answer-matched diagrams selected into the HLD outputs.",
+    )
+    st.session_state.figure_limit = int(_fig_limit)
 
     st.subheader("PPT Style")
     use_template = st.checkbox(
@@ -1076,10 +1857,16 @@ else:
 if st.session_state.selected_products:
     st.markdown("### 3. Guided Design Interview")
     if st.session_state.answers:
-        with st.expander("Answered so far", expanded=False):
-            recent_items = list(st.session_state.answers.items())[-8:]
-            for key, value in recent_items:
-                st.caption(f"{key.replace('_', ' ').title()}: {value}")
+        with st.expander(f"Answered so far ({len(st.session_state.answers)})", expanded=False):
+            from sa_hld_bot.catalog import required_questions
+            _prompt_by_key = {
+                q.key: q.prompt
+                for q in required_questions(st.session_state.selected_products)
+            }
+            for key, value in st.session_state.answers.items():
+                question_text = _prompt_by_key.get(key, key.replace("_", " ").title())
+                st.markdown(f"**{question_text}**")
+                st.caption(str(value))
 
     next_q = first_question()
     if next_q:
@@ -1115,7 +1902,7 @@ if st.session_state.selected_products:
                     on_click=answer_question,
                     args=(selected_options,),
                     disabled=not selected_options,
-                    use_container_width=True,
+                    width="stretch",
                 )
             else:
                 st.markdown("**Suggested answers**")
@@ -1127,7 +1914,7 @@ if st.session_state.selected_products:
                             key=f"answer_{next_q.key}_{idx}",
                             on_click=answer_question,
                             args=(option,),
-                            use_container_width=True,
+                            width="stretch",
                         )
 
         custom = st.chat_input("Answer input")
@@ -1152,113 +1939,228 @@ if st.session_state.selected_products:
                 "Yes, ask the optional questions",
                 key="accept_optional_questions",
                 type="primary",
-                use_container_width=True,
+                width="stretch",
                 on_click=accept_optional_questions,
             )
         with consent_cols[1]:
             st.button(
                 "No, continue with essentials only",
                 key="decline_optional_questions",
-                use_container_width=True,
+                width="stretch",
                 on_click=decline_optional_questions,
             )
     else:
         st.success("Questionnaire complete.")
-        est_seconds = estimate_ppt_generation_seconds()
-        st.info(f"Estimated PPT generation time: ~{est_seconds // 60}m {est_seconds % 60}s")
         generation_sig = _generation_signature()
 
-        with st.expander("Review architecture diagrams (optional)", expanded=False):
-            st.caption(
-                "Preview the diagrams selected for this design based on your answers. "
-                "Untick any diagram you don't want in the generated HLD."
-            )
-            if st.button("Preview diagram selection", key="preview_figures_btn"):
-                st.session_state.figure_candidates = compute_figure_candidates()
-                valid_paths = {str(row.get("local_path", "")) for row in st.session_state.figure_candidates}
-                st.session_state.figure_excluded = [p for p in st.session_state.get("figure_excluded", []) if p in valid_paths]
-                if not st.session_state.figure_candidates:
-                    st.warning("No eligible diagrams found. Build the Tech Zone RAG store first (sidebar).")
-            _candidates = st.session_state.get("figure_candidates", [])
-            if _candidates:
-                from sa_hld_bot.image_select import figure_attribute_tags
-                _excluded = set(st.session_state.get("figure_excluded", []))
-                for _idx, _row in enumerate(_candidates):
-                    _lp = str(_row.get("local_path", ""))
-                    fig_cols = st.columns([2, 3])
-                    with fig_cols[0]:
-                        try:
-                            st.image(_lp, use_container_width=True)
-                        except Exception:
-                            st.caption("(image preview unavailable)")
-                    with fig_cols[1]:
-                        st.markdown(f"**{_row.get('slide_title') or _row.get('caption') or 'Diagram'}**")
-                        if _row.get("caption"):
-                            st.caption(str(_row.get("caption")))
-                        _tags = figure_attribute_tags(_row)
-                        if _tags:
-                            st.caption("Attributes: " + " · ".join(_tags))
-                        if _row.get("page_url"):
-                            st.caption(f"Source: {_row.get('page_url')}")
-                        _keep = st.checkbox(
-                            "Include in HLD",
-                            value=_lp not in _excluded,
-                            key=f"figure_keep_{_idx}",
-                        )
-                        if _keep:
-                            _excluded.discard(_lp)
-                        else:
-                            _excluded.add(_lp)
-                    st.divider()
-                st.session_state.figure_excluded = sorted(_excluded)
-                _kept = len(_candidates) - len([p for p in _excluded if p in {str(r.get('local_path','')) for r in _candidates}])
-                st.caption(f"{_kept} of {len(_candidates)} diagrams will be included.")
-
-        st.caption("You can ask follow-up design questions or edit the diagrams.")
-        user_q = st.chat_input(
-            "Ask about the architecture, or edit diagrams (e.g. 'remove the DMZ image', "
-            "'add a True SSO diagram', 'use double DMZ', 'regenerate')",
-            key="post_question",
+        st.caption(
+            "Chat to refine the HLD: edit diagrams, sections, or design inputs; attach or paste a diagram image "
+            "to ask why it was (not) included or to add/remove it. Everything stays grounded in Omnissa Tech Zone."
         )
-        if user_q:
-            chat_add("user", user_q)
-            _settings, _rag_store, _orchestrator = get_agents()
-            if not _orchestrator or not _rag_store:
-                chat_add("assistant", "Azure AI Foundry and RAG store are required.")
-            else:
-                cmd = parse_command(_rag_store.foundry, user_q) if looks_like_image_command(user_q) else {"action": "none"}
-                if cmd.get("action", "none") != "none":
-                    new_rows, msg = apply_command(
-                        _rag_store, cmd, effective_answers(st.session_state.answers),
-                        st.session_state.selected_products, st.session_state.last_references,
-                        st.session_state.ppt_preview_images, limit=10,
+
+        # Native clipboard paste: Streamlit's chat input / file uploader accept
+        # drag-drop only, so bridge Ctrl+V by forwarding the clipboard image to
+        # the nearest visible dropzone as a synthetic drop event.
+        enable_clipboard_paste_bridge()
+
+        # Chat submission and processing live in render_hld_chat_fragment().
+        # Keeping this legacy branch inert avoids a whole-app chat rerun for
+        # sessions created before the fragment workflow was introduced.
+        _chat_value = None
+        if _chat_value:
+            user_q = getattr(_chat_value, "text", None)
+            if user_q is None:
+                user_q = str(_chat_value)
+            _attached = list(getattr(_chat_value, "files", []) or [])
+            chat_add("user", user_q or "(attached a diagram image)")
+            _log = _app_log()
+            _t0 = time.time()
+            _chat_trace: list[str] = []
+            _log.info("Chat request: %r | attachments=%d", (user_q or "")[:200], len(_attached))
+            with st.status("Thinking — reading your question", expanded=True) as _chat_status:
+                _chat_steps = {"n": 0}
+
+                def _note(message: str) -> None:
+                    _chat_steps["n"] += 1
+                    _chat_trace.append(message)
+                    _chat_status.write(f"**Step {_chat_steps['n']}** — {message}")
+                    _chat_status.update(label=f"Thinking — {message}", expanded=True)
+                    _log.info("Chat step %d: %s", _chat_steps["n"], message)
+
+                _direct_answer = (
+                    _direct_design_conflict_explanation(
+                        user_q, effective_answers(st.session_state.answers)
                     )
-                    st.session_state.ppt_preview_images = new_rows
-                    rebuild_deck_from_state()
-                    chat_add("assistant", msg or "Updated the diagrams.")
+                    if not _attached and _looks_like_why_question(user_q)
+                    else ""
+                )
+                if _direct_answer:
+                    _note("Comparing the requested diagram with your availability and site selections")
+                    _note("Preparing a direct explanation from the verified design inputs")
+                    chat_add("assistant", _direct_answer)
+                    _settings = _rag_store = _orchestrator = None
                 else:
-                    result = _orchestrator.answer(user_q)
-                    if result.blocked:
-                        chat_add("assistant", f"Blocked by guardrail: {result.blocked_reason}")
+                    _note("Loading the HLD design inputs and Tech Zone context")
+                    _settings, _rag_store, _orchestrator = initialize_agents()
+
+                if _direct_answer:
+                    pass
+                elif not _orchestrator or not _rag_store:
+                    chat_add("assistant", "Azure AI Foundry and RAG store are required.")
+                    _chat_status.update(label="Azure AI Foundry and RAG store are required", state="error")
+                elif _attached:
+                    from sa_hld_bot.feedback import caption_key, match_uploaded_image
+                    _library = _caption_rows_local()
+                    _note(f"Matching the pasted image against {len(_library)} Tech Zone diagrams")
+                    _match = match_uploaded_image(_library, _attached[0].read())
+                    _log.info("Image match finished in %.1fs -> %s", time.time() - _t0,
+                              (_match or {}).get("caption", "NO MATCH"))
+                    _tl = (user_q or "").lower()
+                    _wants_rationale = (
+                        not _tl
+                        or "why" in _tl or "rationale" in _tl or "reason" in _tl or "explain" in _tl
+                    )
+                    if _match is None:
+                        chat_add("assistant", "I couldn't match that image to any diagram in the Tech Zone library.")
+                    elif not _wants_rationale and any(w in _tl for w in ("add", "include", "insert")):
+                        _note(f"Adding '{(_match.get('caption') or '')[:60]}' and rebuilding the HLD")
+                        _row = dict(_match)
+                        _row["slide_title"] = _row.get("caption") or _row.get("title")
+                        st.session_state.ppt_preview_images = list(st.session_state.ppt_preview_images) + [_row]
+                        rebuild_deck_from_state()
+                        chat_add("assistant", f"Added '{_match.get('caption', '')}' to the HLD and rebuilt the outputs.")
+                    elif not _wants_rationale and any(w in _tl for w in ("remove", "drop", "delete", "exclude")):
+                        _note(f"Removing '{(_match.get('caption') or '')[:60]}' and rebuilding the HLD")
+                        from sa_hld_bot.image_select import image_content_keys
+                        _target = {k for k in (*image_content_keys(str(_match.get("local_path", ""))), caption_key(_match)) if k}
+                        _kept = []
+                        for _r in st.session_state.ppt_preview_images:
+                            _keys = {k for k in (*image_content_keys(str(_r.get("local_path", ""))), caption_key(_r)) if k}
+                            if _keys & _target:
+                                continue
+                            _kept.append(_r)
+                        _removed = len(st.session_state.ppt_preview_images) - len(_kept)
+                        st.session_state.ppt_preview_images = _kept
+                        if _removed:
+                            rebuild_deck_from_state()
+                            chat_add("assistant", f"Removed '{_match.get('caption', '')}' and rebuilt the HLD.")
+                        else:
+                            chat_add("assistant", "That diagram isn't currently in the HLD.")
                     else:
-                        refs = "\n".join(f"- {src}" for src in result.citations[:8])
-                        chat_add("assistant", f"{result.answer}\n\nSources:\n{refs}")
+                        _note("Analyzing the diagram against your design answers")
+                        from sa_hld_bot.hld_followup import conversational_rationale
+                        from sa_hld_bot.image_select import explain_figure_selection
+                        _facts = explain_figure_selection(
+                            _match,
+                            effective_answers(st.session_state.answers),
+                            st.session_state.selected_products,
+                            st.session_state.get("last_references", []),
+                            st.session_state.get("ppt_preview_images", []),
+                            data_dir=ROOT / "data",
+                        )
+                        _note("Writing the answer")
+                        chat_add("assistant", conversational_rationale(_rag_store.foundry, user_q, _facts))
+                else:
+                    _note("Interpreting your request")
+                    cmd = parse_command(_rag_store.foundry, user_q) if looks_like_image_command(user_q) else {"action": "none"}
+                    if cmd.get("action", "none") != "none":
+                        _note("Updating the diagram set and rebuilding the HLD")
+                        new_rows, msg = apply_command(
+                            _rag_store, cmd, effective_answers(st.session_state.answers),
+                            st.session_state.selected_products, st.session_state.last_references,
+                            st.session_state.ppt_preview_images,
+                            limit=int(st.session_state.get("figure_limit", 10)),
+                        )
+                        st.session_state.ppt_preview_images = new_rows
+                        rebuild_deck_from_state()
+                        chat_add("assistant", msg or "Updated the diagrams.")
+                    else:
+                        from sa_hld_bot.hld_followup import looks_like_edit_command, parse_hld_command
+                        hld_cmd = {"action": "qa"}
+                        if looks_like_edit_command(user_q):
+                            custom_slugs = [_slugify(s.get("title", "")) for s in st.session_state.get("custom_sections", [])]
+                            hld_cmd = parse_hld_command(
+                                _rag_store.foundry, user_q,
+                                answer_keys=list(st.session_state.answers.keys()),
+                                product_keys=st.session_state.selected_products + custom_slugs,
+                            )
+                        if hld_cmd.get("action", "qa") != "qa":
+                            _note("Applying the change (Tech Zone grounded) and rebuilding the HLD")
+                            msg = apply_hld_edit(hld_cmd, _orchestrator, _rag_store)
+                            chat_add("assistant", msg or "Done — HLD updated.")
+                        elif _looks_like_why_question(user_q) and (_why_row := _find_row_by_keywords(user_q)) is not None:
+                            _note("Analyzing the diagram against your design answers")
+                            from sa_hld_bot.hld_followup import conversational_rationale
+                            from sa_hld_bot.image_select import explain_figure_selection
+                            _facts = explain_figure_selection(
+                                _why_row,
+                                effective_answers(st.session_state.answers),
+                                st.session_state.selected_products,
+                                st.session_state.get("last_references", []),
+                                st.session_state.get("ppt_preview_images", []),
+                                data_dir=ROOT / "data",
+                            )
+                            _note("Writing the answer")
+                            chat_add("assistant", conversational_rationale(_rag_store.foundry, user_q, _facts))
+                        else:
+                            _note("Searching Tech Zone and writing a grounded answer")
+                            result = _orchestrator.answer(user_q)
+                            if result.blocked:
+                                chat_add("assistant", f"Blocked by guardrail: {result.blocked_reason}")
+                            else:
+                                refs = "\n".join(f"- {src}" for src in result.citations[:8])
+                                chat_add("assistant", f"{result.answer}\n\nSources:\n{refs}")
+                _log.info("Chat request completed in %.1fs", time.time() - _t0)
+                for _message in reversed(st.session_state.messages):
+                    if _message.get("role") == "assistant":
+                        _message["details"] = list(_chat_trace)
+                        break
+                _chat_status.update(
+                    label=f"Answer ready in {time.time() - _t0:.0f}s", state="complete", expanded=True,
+                )
             st.rerun()
 
-        if st.button("Generate Customer HLD PPT", type="primary"):
-            _settings, _rag_store, _orchestrator = get_agents()
-            if not _orchestrator or not _rag_store:
-                st.error("Azure AI Foundry and RAG store are required.")
-            else:
-                with st.spinner(f"Generating RAG-grounded customer PowerPoint (estimated ~{est_seconds // 60}m {est_seconds % 60}s)..."):
-                    output_path, docx_path, refs, _preview = generate_hld_outputs(_orchestrator, _rag_store)
-                st.session_state.generated_signature = generation_sig
-                refs_short = "\n".join(f"- {url}" for url in refs[:6])
-                chat_add(
-                    "assistant",
-                    f"HLD outputs generated: `{output_path}` and `{docx_path}`\n\nTop references used:\n{refs_short}",
-                )
-                st.rerun()
+        if st.button("Generate Customer HLD Document", type="primary"):
+            _est = estimated_generation_seconds()
+            _start_ts = time.time()
+            with st.status(
+                f"Generating HLD — estimated ~{_est // 60}m {_est % 60:02d}s",
+                expanded=True,
+            ) as _gen_status:
+                _step_counter = {"n": 0}
+
+                def _progress(message: str) -> None:
+                    _step_counter["n"] += 1
+                    _gen_status.write(f"**Step {_step_counter['n']}** — {message}")
+                    _gen_status.update(label=f"Generating HLD — {message}", expanded=True)
+
+                _progress("Loading AI agents and vector store")
+                _settings, _rag_store, _orchestrator = initialize_agents()
+                if not _orchestrator or not _rag_store:
+                    _gen_status.update(
+                        label="Azure AI Foundry and RAG store are required",
+                        state="error",
+                        expanded=True,
+                    )
+                else:
+                    output_path, docx_path, refs, _preview = generate_hld_outputs(
+                        _orchestrator, _rag_store, progress=_progress
+                    )
+                    _elapsed = int(time.time() - _start_ts)
+                    _record_generation_time(_elapsed)
+                    _gen_status.update(
+                        label=f"HLD generated in {_elapsed // 60}m {_elapsed % 60:02d}s",
+                        state="complete",
+                        expanded=True,
+                    )
+                    st.session_state.generated_signature = generation_sig
+                    refs_short = "\n".join(f"- {url}" for url in refs[:6])
+                    chat_add(
+                        "assistant",
+                        f"HLD generated in {_elapsed // 60}m {_elapsed % 60:02d}s: `{output_path}` and `{docx_path}`"
+                        f"\n\nTop references used:\n{refs_short}",
+                    )
+                    st.rerun()
 
         if st.session_state.ppt_path:
             file_path = Path(st.session_state.ppt_path)
@@ -1280,26 +2182,215 @@ if st.session_state.selected_products:
                         file_name=docx_file.name,
                         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                     )
-        if st.session_state.ppt_path:
-            st.markdown("### PPT Content Preview")
-            st.caption("Live preview of generated architecture narrative and diagrams.")
-            for section in st.session_state.ppt_preview:
-                with st.expander(section.get("title", "Slide"), expanded=False):
-                    st.write(section.get("content", ""))
-            if st.session_state.ppt_preview_images:
-                st.markdown("### Architecture Diagram Preview")
-                cols = st.columns(2)
-                for idx, image_row in enumerate(st.session_state.ppt_preview_images[:24]):
-                    image_path = image_row.get("local_path", "")
-                    if not image_path:
-                        continue
-                    with cols[idx % 2]:
-                        if Path(image_path).exists():
-                            st.image(
-                                image_path,
-                                caption=image_row.get("caption", "Architecture diagram from Omnissa Tech Zone"),
-                                width="stretch",
+
+        # ---------------- Architecture diagram curation (designer-style) ----------------
+        if st.session_state.ppt_path or st.session_state.docx_path:
+            st.markdown(
+                """<style>
+                div[data-testid="stImage"] img {border-radius: 10px;}
+                div[data-testid="stVerticalBlockBorderWrapper"] {border-radius: 14px;}
+                </style>""",
+                unsafe_allow_html=True,
+            )
+            st.markdown("### Review Architecture Diagrams")
+            st.caption(
+                "Curate the diagrams in this HLD: toggle any diagram out, leave per-diagram feedback "
+                "(it trains future selection), add new ones, or prompt the chat below — e.g. "
+                "'replace the DMZ diagram with the double-DMZ version'."
+            )
+            from sa_hld_bot.feedback import caption_key as _cap_key
+            from sa_hld_bot.image_select import figure_attribute_tags as _fig_tags
+
+            _shown_rows = st.session_state.get("ppt_preview_images", [])
+            _add_cols = st.columns([2, 5])
+            with _add_cols[0]:
+                with st.popover("➕ Add a diagram", width="stretch"):
+                    _add_desc = st.text_input(
+                        "Describe the diagram to add",
+                        placeholder="e.g. True SSO authentication flow",
+                        key="add_diag_desc",
+                    )
+                    _add_upload = st.file_uploader(
+                        "Or paste (Ctrl/Cmd+V) or drop the diagram image here",
+                        type=["png", "jpg", "jpeg"],
+                        key="add_diag_upl",
+                    )
+
+                    def _run_pasted_diagram_search() -> bool:
+                        if _add_upload is None:
+                            return False
+                        with st.status("Searching the Tech Zone diagram RAG...", expanded=True) as _match_status:
+                            _match_step = {"number": 0}
+
+                            def _match_progress(message: str) -> None:
+                                _match_step["number"] += 1
+                                _match_status.write(f"**Step {_match_step['number']}** — {message}")
+                                _match_status.update(label=message, state="running", expanded=True)
+
+                            _result = add_uploaded_diagram_from_rag(
+                                _add_upload.getvalue(),
+                                str(getattr(_add_upload, "type", "") or "image/png"),
+                                progress=_match_progress,
                             )
+                            st.session_state.add_diagram_match_notice = _result
+                            if _result.get("status") == "added":
+                                _match_status.update(label=str(_result.get("message")), state="complete", expanded=False)
+                                st.toast(str(_result.get("message")), icon="✅")
+                                return True
+                            if _result.get("status") == "existing":
+                                _match_status.update(label=str(_result.get("message")), state="complete", expanded=False)
+                            else:
+                                _match_status.update(label="No confident RAG match found", state="error", expanded=True)
+                            return False
+
+                    if _add_upload is not None:
+                        import hashlib as _hl2
+
+                        _add_bytes = _add_upload.getvalue()
+                        _add_digest = _hl2.md5(_add_bytes).hexdigest()
+                        if st.session_state.get("last_pasted_add_digest") != _add_digest:
+                            st.session_state.last_pasted_add_digest = _add_digest
+                            st.session_state.add_diagram_match_notice = {}
+                            if _run_pasted_diagram_search():
+                                st.rerun()
+                    _add_notice = dict(st.session_state.get("add_diagram_match_notice") or {})
+                    if _add_notice.get("status") == "not_found":
+                        st.warning(
+                            "No confident Tech Zone diagram match was found. "
+                            f"{_add_notice.get('message', '')} You can refine the search with a description above."
+                        )
+                    elif _add_notice.get("status") == "existing":
+                        st.info(str(_add_notice.get("message", "That diagram is already in the HLD.")))
+                    elif _add_notice.get("status") == "unavailable":
+                        st.error(str(_add_notice.get("message", "The Tech Zone RAG store is unavailable.")))
+                    if st.button("Search Tech Zone and add", key="add_diag_btn", type="primary"):
+                        if _add_upload is not None and not _add_desc.strip():
+                            if _run_pasted_diagram_search():
+                                st.rerun()
+                        else:
+                            _settings, _rag_store, _orchestrator = get_agents()
+                            if not _rag_store:
+                                st.error("RAG store is required.")
+                            elif not _add_desc.strip():
+                                st.info("Paste a diagram or describe it first.")
+                            else:
+                                _words = [w for w in re.findall(r"[a-z0-9-]+", _add_desc.lower())
+                                          if len(w) > 3 and w not in _WHY_STOPWORDS]
+                                _new_rows, _msg = apply_command(
+                                    _rag_store,
+                                    {"action": "add", "keywords": _words or [_add_desc.lower()], "dmz": "", "indexes": []},
+                                    effective_answers(st.session_state.answers),
+                                    st.session_state.selected_products,
+                                    st.session_state.last_references,
+                                    _shown_rows,
+                                    limit=int(st.session_state.get("figure_limit", 10)),
+                                )
+                                if len(_new_rows) != len(_shown_rows):
+                                    st.session_state.ppt_preview_images = _new_rows
+                                    with st.spinner("Rebuilding the HLD with the new diagram...", show_time=True):
+                                        rebuild_deck_from_state()
+                                    st.toast(_msg, icon="✅")
+                                    st.rerun()
+                                else:
+                                    st.warning(_msg)
+
+            if not _shown_rows:
+                st.info("No diagrams are currently embedded. Use ➕ Add a diagram or the chat below.")
+            _pending_exclude: list[tuple[str, dict]] = []
+            _grid = st.columns(2)
+            for _i, _row in enumerate(_shown_rows):
+                _ck = _cap_key(_row) or f"idx{_i}"
+                with _grid[_i % 2]:
+                    with st.container(border=True):
+                        _lp = str(_row.get("local_path", ""))
+                        try:
+                            st.image(_lp, width="stretch")
+                        except Exception:
+                            st.caption("(preview unavailable)")
+                        st.markdown(f"**{_row.get('caption') or _row.get('slide_title') or 'Diagram'}**")
+                        _tags = _fig_tags(_row)
+                        if _tags:
+                            st.caption(" · ".join(_tags))
+                        _ctl = st.columns([1.1, 1])
+                        _included = _ctl[0].toggle("Include", value=True, key=f"diag_inc_{_ck}")
+                        with _ctl[1].popover("💬 Feedback", width="stretch"):
+                            _fb_text = st.text_area(
+                                "Issue or comment",
+                                key=f"diag_fb_{_ck}",
+                                placeholder="e.g. wrong DMZ layout for this design",
+                            )
+                            _fb_btns = st.columns(2)
+                            if _fb_btns[0].button("👍 Right", key=f"diag_up_{_ck}"):
+                                record_figure_feedback("up", _row, _fb_text)
+                                st.toast("Reinforced for similar designs", icon="👍")
+                            if _fb_btns[1].button("👎 Wrong", key=f"diag_down_{_ck}"):
+                                record_figure_feedback("down", _row, _fb_text)
+                                st.toast("Recorded — the selector will learn from this", icon="👎")
+                        if not _included:
+                            _pending_exclude.append((_ck, _row))
+            if _pending_exclude:
+                st.warning(f"{len(_pending_exclude)} diagram(s) marked for removal.")
+                if st.button(
+                    f"Apply changes — remove {len(_pending_exclude)} diagram(s) and rebuild the HLD",
+                    type="primary",
+                    key="apply_diag_changes",
+                ):
+                    with st.status("Updating the HLD...", expanded=True) as _upd_status:
+                        _upd_status.write("**Step 1** — Recording feedback for removed diagrams")
+                        _drop_keys = set()
+                        for _ck, _row in _pending_exclude:
+                            _drop_keys.add(_ck)
+                            record_figure_feedback(
+                                "down", _row,
+                                st.session_state.get(f"diag_fb_{_ck}", "") or "Excluded during diagram review",
+                            )
+                        _upd_status.write("**Step 2** — Removing diagrams from the HLD")
+                        st.session_state.ppt_preview_images = [
+                            r for r in _shown_rows if (_cap_key(r) or "") not in _drop_keys
+                        ]
+                        _upd_status.write("**Step 3** — Rebuilding Word and PowerPoint outputs")
+                        rebuild_deck_from_state()
+                        _upd_status.update(label="HLD updated", state="complete", expanded=False)
+                    for _ck, _row in _pending_exclude:
+                        st.session_state.pop(f"diag_inc_{_ck}", None)
+                    st.rerun()
+
+        if st.session_state.ppt_path or st.session_state.docx_path:
+            st.markdown("#### Rate this HLD")
+            st.caption(
+                "Your rating trains diagram selection: 👍 reinforces this diagram set for similar designs; "
+                "👎 records what was wrong so it is avoided next time."
+            )
+            fb_cols = st.columns([1, 1, 5])
+            if fb_cols[0].button("👍 Good output", key="fb_up_btn"):
+                record_hld_feedback("up")
+                st.session_state.feedback_mode = ""
+                st.success("Thanks — this diagram set is now reinforced for similar designs.")
+            if fb_cols[1].button("👎 Needs work", key="fb_down_btn"):
+                st.session_state.feedback_mode = "down"
+            if st.session_state.get("feedback_mode") == "down":
+                with st.form("fb_down_form", clear_on_submit=True):
+                    fb_reason = st.text_area(
+                        "What was unsatisfying, missing, or wrong?",
+                        placeholder="e.g. the DMZ diagram shows a single DMZ but we chose double; the networking section lacks port details",
+                    )
+                    fb_image = st.file_uploader(
+                        "Optional: upload the diagram that was wrong or should have been included",
+                        type=["png", "jpg", "jpeg"],
+                    )
+                    fb_submit = st.form_submit_button("Submit feedback")
+                if fb_submit:
+                    extra = record_hld_feedback(
+                        "down",
+                        reason=fb_reason,
+                        uploaded=fb_image.read() if fb_image else None,
+                    )
+                    st.session_state.feedback_mode = ""
+                    st.success("Recorded — selections and narratives for similar designs will learn from this." + extra)
+
+        # Fragment-local reruns keep the rest of the generated HLD interactive
+        # and unchanged while a follow-up question is being processed.
+        render_hld_chat_fragment()
 
 show_reference_panels = bool(st.session_state.selected_products) and (
     bool(st.session_state.last_references)

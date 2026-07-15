@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from copy import deepcopy
 from datetime import date
 from pathlib import Path
 from typing import Iterable
@@ -95,6 +96,8 @@ def _load_balancer_applicable(answers: dict[str, str]) -> bool:
 
 def _is_blocked_generic_connection(row: dict[str, str]) -> bool:
     text = _row_text(row)
+    if "load balanc" in text:
+        return False
     return ("internal connection" in text or "external connection" in text) and "blast" not in text
 
 
@@ -489,6 +492,8 @@ class HldDocxBuilder:
         rag_narrative: dict[str, str],
         references: list[str],
         image_rows: list[dict[str, str]],
+        custom_sections: list[dict] | None = None,
+        excluded_sections: set[str] | list[str] | None = None,
     ) -> Path:
         self._used_image_paths = set()
         self._used_image_signatures = set()
@@ -519,17 +524,32 @@ class HldDocxBuilder:
 
         # Main body.
         doc.add_section(WD_SECTION.NEW_PAGE)
-        self._key_contacts(doc, questionnaire)
-        self._overview(doc, customer_name, selected_products, questionnaire, rag_narrative)
-        self._requirements(doc, questionnaire)
-        self._solution_overview(doc, questionnaire, rag_narrative, image_rows)
-        self._detailed_design(doc, selected_products, questionnaire, rag_narrative, image_rows)
-        self._networking(doc, questionnaire, rag_narrative, image_rows)
-        self._security(doc, questionnaire, rag_narrative, image_rows)
-        self._business_continuity(doc, questionnaire, rag_narrative, image_rows)
+        excluded = {str(s).lower() for s in (excluded_sections or [])}
+        products_in_scope = [p for p in selected_products if p.key not in excluded]
+        if "key_contacts" not in excluded:
+            self._key_contacts(doc, questionnaire)
+        if "overview" not in excluded and "summary" not in excluded:
+            self._overview(doc, customer_name, selected_products, questionnaire, rag_narrative)
+        if "requirements" not in excluded:
+            self._requirements(doc, questionnaire)
+        if "solution_overview" not in excluded and "architecture" not in excluded:
+            self._solution_overview(doc, questionnaire, rag_narrative, image_rows)
+        self._detailed_design(doc, products_in_scope, questionnaire, rag_narrative, image_rows)
+        if "networking" not in excluded:
+            self._networking(doc, questionnaire, rag_narrative, image_rows)
+        if "security" not in excluded:
+            self._security(doc, questionnaire, rag_narrative, image_rows)
+        if "business_continuity" not in excluded and "operations" not in excluded:
+            self._business_continuity(doc, questionnaire, rag_narrative, image_rows)
+        for section in custom_sections or []:
+            self._custom_section(doc, section, questionnaire, image_rows)
+        if "additional_views" not in excluded:
+            self._additional_views(doc, image_rows, questionnaire)
         self._references(doc, used_refs)
-        self._review_acceptance(doc, questionnaire)
+        if "review_acceptance" not in excluded:
+            self._review_acceptance(doc, questionnaire)
 
+        self._highlight_to_be_confirmed(doc)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         doc.save(output_path)
         return output_path
@@ -599,6 +619,53 @@ class HldDocxBuilder:
             update = OxmlElement("w:updateFields")
             settings.append(update)
         update.set(qn("w:val"), "true")
+
+    def _highlight_to_be_confirmed(self, doc: Document) -> None:
+        """Highlight every generated ``To be confirmed`` marker in yellow."""
+        roots = [doc.element.body]
+        seen_parts: set[int] = set()
+        for section in doc.sections:
+            for container in (section.header, section.footer):
+                part_id = id(container.part)
+                if part_id not in seen_parts:
+                    seen_parts.add(part_id)
+                    roots.append(container._element)
+
+        for root in roots:
+            for run in list(root.iter(qn("w:r"))):
+                text = "".join(node.text or "" for node in run.iter(qn("w:t")))
+                if not re.search(r"to be confirmed", text, flags=re.IGNORECASE):
+                    continue
+
+                parent = run.getparent()
+                if parent is None:
+                    continue
+                insert_at = parent.index(run)
+                segments = re.split(r"(to be confirmed)", text, flags=re.IGNORECASE)
+                for segment in (part for part in segments if part):
+                    replacement = deepcopy(run)
+                    for child in list(replacement):
+                        if child.tag != qn("w:rPr"):
+                            replacement.remove(child)
+
+                    text_node = OxmlElement("w:t")
+                    if segment[:1].isspace() or segment[-1:].isspace():
+                        text_node.set(qn("xml:space"), "preserve")
+                    text_node.text = segment
+                    replacement.append(text_node)
+
+                    if segment.lower() == "to be confirmed":
+                        run_properties = replacement.get_or_add_rPr()
+                        existing = run_properties.find(qn("w:highlight"))
+                        if existing is not None:
+                            run_properties.remove(existing)
+                        highlight = OxmlElement("w:highlight")
+                        highlight.set(qn("w:val"), "yellow")
+                        run_properties.append(highlight)
+
+                    parent.insert(insert_at, replacement)
+                    insert_at += 1
+                parent.remove(run)
 
     def _enable_heading_numbering(self, doc: Document) -> None:
         """Attach multilevel numbering (1, 1.1, 1.1.1 ...) to Heading 1-5."""
@@ -1114,6 +1181,42 @@ class HldDocxBuilder:
         )
         if "multi-site" in _answer(answers, "site_topology").lower() or "active" in _answer(answers, "availability_requirements").lower():
             self._add_figures(doc, images, ("active-active", "active-passive", "multi-site", "cloud pod", "operations dashboard"), limit=2, answers=answers)
+
+    def _custom_section(self, doc: Document, section: dict, answers: dict[str, str], images: list[dict[str, str]]) -> None:
+        """Render a user-requested section (title + grounded narrative + figures)."""
+        title = _clean_text(section.get("title", ""), 120) or "Additional Design Topic"
+        self._h1(doc, title)
+        self._current_section = "design"
+        self._narrative(doc, section.get("content", ""), "Content for this section is pending detailed design.")
+        keywords = tuple(k for k in (section.get("keywords") or []) if k)
+        if keywords:
+            self._add_figures(doc, images, keywords, limit=2, answers=answers)
+
+    def _additional_views(self, doc: Document, images: list[dict[str, str]], answers: dict[str, str]) -> None:
+        """Place any selected diagrams the section keyword filters did not use.
+
+        The selection engine already validated every row against the answers, so
+        dropping leftovers silently loses relevant content; instead they are
+        documented here as supporting views.
+        """
+        remaining = [
+            row for row in images
+            if str(row.get("local_path", "")) not in self._used_image_paths
+            and _figure_signature(row) not in self._used_image_signatures
+            and not _is_blocked_generic_connection(row)
+            and not _figure_conflicts_with_answers(row, answers, self._product_keys)
+        ]
+        if not remaining:
+            return
+        self._h1(doc, "Additional Architecture Views")
+        self._current_section = "design"
+        self._paragraph(
+            doc,
+            "The following supporting diagrams were matched to the design inputs and provide additional "
+            "architectural detail for implementation planning.",
+        )
+        for row in remaining:
+            self._add_figure(doc, row, answers)
 
     def _references(self, doc: Document, references: list[str]) -> None:
         self._h1(doc, "References")
